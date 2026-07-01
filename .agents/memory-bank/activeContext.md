@@ -13,6 +13,10 @@ All planned features for the current development cycle have been implemented and
 4. **Inverse Mapping & Tectonics** — Refactorized plate projection to "Inverse Mapping" (Backward Advection) to mathematically eliminate grid tearing artifacts using the inverse Rodrigues Rotation formula. Scaled down angular rotation velocities to prevent continent disintegration.
 5. **Voronoi Biomes & Automata** — Resolved the mega-desert issue by seeding biomes via Holdridge, flood-filling the map, and applying 2 passes of cellular automata for organic clusters.
 6. **Accurate Map Rendering** — Updated MapExporter to exactly match the ImGui legend color bands, rendering crisp elevation, and setting dry land to pure dark gray to highlight bright rivers/lakes.
+7. **Oceanic Plates & Orogenesis** — Explicitly defined Oceanic vs Continental plates with negative crustal bases, driving trench formation on subduction and huge Himalayas-style ranges during continental collisions.
+8. **Continuous Global FBM Noise** — Eradicated giant cliffs, "walls", and terrain tearing by removing per-plate noise offsets and abandoning the advective tectonic drift approach in favor of stable, seamless geometric Voronoi borders.
+9. **Precipitation Baseline Rebalance** — Implemented a baseline evaporation/rain cycle for flat plains in the CUDA `AtmosphereSimulator`, curing the "megadesert" issue and restoring grassy plains and steppes.
+10. **Steep Slope 3D Masking** — The engine dynamically calculates local vertex slopes in real-time, preventing snow from rendering on vertical cliffs to expose raw bedrock.
 
 ## Active Focus
 - [ ] Connect the ocean simulator to the atmospheric climate (Wind-driven SWE / Munk vorticity).
