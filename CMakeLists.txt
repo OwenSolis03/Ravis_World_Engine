@@ -4,6 +4,12 @@ project(RavisWorldEngine VERSION 1.0)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED True)
 
+# Enable CUDA
+enable_language(CUDA)
+set(CMAKE_CUDA_STANDARD 20)
+set(CMAKE_CUDA_STANDARD_REQUIRED True)
+set(CMAKE_CUDA_ARCHITECTURES 89)
+
 # Add include directories
 include_directories(include)
 include_directories(third_party)
@@ -13,10 +19,13 @@ set(SOURCES
     src/main.cpp
     src/GoldbergPolyhedron.cpp
     src/MapExporter.cpp
-    src/TectonicSimulator.cpp
-    src/AtmosphereSimulator.cpp
-    src/ErosionSimulator.cpp
+    src/MapExporterCUDA.cu
+    src/TectonicSimulator.cu
+    src/AtmosphereSimulator.cu
+    src/OceanSimulator.cu
+    src/ErosionSimulator.cu
     src/PedologySimulator.cpp
+    src/HydrologySimulator.cpp
 )
 
 # Find OpenMP for erosion parallelism
@@ -61,9 +70,12 @@ target_include_directories(RavisWorldEngine PRIVATE
     ${imgui_SOURCE_DIR}/backends
 )
 
+# Find OpenGL (cross-platform)
+find_package(OpenGL REQUIRED)
+
 # Link OpenMP, GLFW and OpenGL
 target_link_libraries(RavisWorldEngine PRIVATE 
     OpenMP::OpenMP_CXX 
     glfw 
-    opengl32
+    OpenGL::GL
 )

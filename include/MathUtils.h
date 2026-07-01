@@ -40,5 +40,33 @@ inline double distance(const Vector3& a, const Vector3& b) {
     return std::sqrt(dx * dx + dy * dy + dz * dz);
 }
 
+// Dot product of two 3D vectors
+inline double dotProduct(const Vector3& a, const Vector3& b) {
+    return a.x * b.x + a.y * b.y + a.z * b.z;
+}
+
+// Cross product of two 3D vectors
+inline Vector3 crossProduct(const Vector3& a, const Vector3& b) {
+    return Vector3(
+        a.y * b.z - a.z * b.y,
+        a.z * b.x - a.x * b.z,
+        a.x * b.y - a.y * b.x
+    );
+}
+
+// Rodrigues' rotation formula to rotate vector v around unit axis k by angle theta
+inline Vector3 rodriguesRotation(const Vector3& v, const Vector3& k, double theta) {
+    double cos_theta = std::cos(theta);
+    double sin_theta = std::sin(theta);
+    Vector3 cross = crossProduct(k, v);
+    double dot = dotProduct(k, v);
+    
+    return Vector3(
+        v.x * cos_theta + cross.x * sin_theta + k.x * dot * (1.0 - cos_theta),
+        v.y * cos_theta + cross.y * sin_theta + k.y * dot * (1.0 - cos_theta),
+        v.z * cos_theta + cross.z * sin_theta + k.z * dot * (1.0 - cos_theta)
+    );
+}
+
 } // namespace Math
 } // namespace Ravis

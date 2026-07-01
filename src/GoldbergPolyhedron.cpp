@@ -2,6 +2,7 @@
 #include "../include/MathUtils.h"
 #include <algorithm>
 #include <cmath>
+#include <unordered_set>
 
 namespace Ravis {
 
@@ -118,7 +119,7 @@ void GoldbergPolyhedron::extractCells() {
         cells[i].longitude = lon;
 
         // Initialize default attributes
-        cells[i].height = 0.5f; // Sea level by default
+        cells[i].elevation = 0.0f; // Sea level by default
         cells[i].plate_id = -1;
         cells[i].plate_velocity = Vector3(0, 0, 0);
         cells[i].temperature = 0.0f;
@@ -127,23 +128,25 @@ void GoldbergPolyhedron::extractCells() {
         cells[i].wind_velocity = Vector3(0, 0, 0);
         cells[i].bedrock = RockType::BASALT;
         cells[i].soil = SoilType::NONE;
+        cells[i].crustal_age = 0.0f;
+        cells[i].crustal_thickness = 35.0f;
+        cells[i].sediment_depth = 0.0f;
     }
 
-    // Build neighbor adjacency list using the triangles
+    // Build neighbor adjacency list using unordered_sets for O(1) dedup
+    std::vector<std::unordered_set<size_t>> neighborSets(vertices.size());
+
     for (const auto& tri : triangles) {
         for (int i = 0; i < 3; ++i) {
             size_t vA = tri.v[i];
             size_t vB = tri.v[(i + 1) % 3];
-            
-            // Add vB as neighbor to vA
-            if (std::find(cells[vA].neighbors.begin(), cells[vA].neighbors.end(), vB) == cells[vA].neighbors.end()) {
-                cells[vA].neighbors.push_back(vB);
-            }
-            // Add vA as neighbor to vB
-            if (std::find(cells[vB].neighbors.begin(), cells[vB].neighbors.end(), vA) == cells[vB].neighbors.end()) {
-                cells[vB].neighbors.push_back(vA);
-            }
+            neighborSets[vA].insert(vB);
+            neighborSets[vB].insert(vA);
         }
+    }
+
+    for (size_t i = 0; i < vertices.size(); ++i) {
+        cells[i].neighbors.assign(neighborSets[i].begin(), neighborSets[i].end());
     }
 }
 

@@ -20,9 +20,14 @@ enum class BiomeType {
     BOREAL_FOREST,
     TEMPERATE_FOREST,
     GRASSLAND,
+    STEPPE,
     RAINFOREST,
+    TEMPERATE_RAINFOREST,
+    TROPICAL_DRY_FOREST,
+    MEDITERRANEAN,
     DESERT,
-    SAVANNA
+    SAVANNA,
+    THORN_SCRUB
 };
 
 enum class RockType {
@@ -48,7 +53,7 @@ struct Cell {
     Vector3 position; // 3D cartesian coordinates for easy distance math
 
     // Attributes
-    float height = 0.0f; // Normalized height (0.0 to 1.0)
+    float elevation = 0.0f; // Elevation in meters. Negative = below sea level.
     bool is_oceanic = false; // Crust type: true for oceanic, false for continental
     int plate_id = -1;
     Vector3 plate_velocity = Vector3(0,0,0);
@@ -62,14 +67,19 @@ struct Cell {
     SoilType soil = SoilType::NONE;
     BiomeType biome = BiomeType::OCEAN;
 
+    // Geophysics
+    float crustal_age = 0.0f;        // Ma — older oceanic crust is denser and subducts
+    float crustal_thickness = 35.0f; // km — continental ~35km, oceanic ~7km
+    float sediment_depth = 0.0f;     // Accumulated sedimentary layer thickness
+
+    // Hydrology
+    bool is_lake = false;            // True if this cell is part of a lake
+    float river_flow = 0.0f;         // Accumulated water flow from upstream cells
+    size_t downstream_id = 0;        // ID of the cell this flows into (steepest descent)
+
     // Topology
     std::vector<size_t> neighbors; // IDs of neighboring cells
 };
 
-// Helper function to interpolate normalized height to real-world meters
-// e.g., 0.0 -> -50,000m (deepest trench), 1.0 -> 30,000m (highest peak)
-inline float lerpHeight(float normalized_height, float min_height = -50000.0f, float max_height = 30000.0f) {
-    return min_height + normalized_height * (max_height - min_height);
-}
-
 } // namespace Ravis
+

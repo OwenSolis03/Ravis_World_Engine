@@ -10,15 +10,15 @@ void PedologySimulator::generateSoils(const SimulationParameters& params) {
 
     for (auto& cell : cells) {
         // No soil underwater
-        if (cell.height <= params.sea_level) {
+        if (cell.elevation <= params.sea_level) {
             cell.soil = SoilType::NONE;
             continue;
         }
 
         // Base rules for soil generation
 
-        // 1. Coastlines are mostly sand
-        if (cell.height <= params.sea_level + 0.02f) {
+        // 1. Coastlines are mostly sand (within 200m elevation of sea level)
+        if (cell.elevation <= params.sea_level + 200.0f) {
             cell.soil = SoilType::SAND;
             continue;
         }

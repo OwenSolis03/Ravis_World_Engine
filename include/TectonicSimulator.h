@@ -23,12 +23,23 @@ private:
     struct Hotspot {
         Vector3 position;
         float strength;
+        float radius = 0.1f;
+        bool is_deep = false;
     };
     std::vector<Hotspot> hotspots;
 
+    struct PlateData {
+        bool is_oceanic;
+        Vector3 rotation_axis;
+        float angular_speed;
+        Vector3 center; // Seed centroid position
+    };
+    std::vector<PlateData> plates;
+
     void simulateStep(const SimulationParameters& params);
     void simulateHotspots();
-    void generateHotspots(int numHotspots);
+    void generateHotspots(const SimulationParameters& params);
+    void applyTerrainFeatures(const SimulationParameters& params);
 };
 
 } // namespace Ravis
