@@ -1,3 +1,0 @@
-C:\Users\laser\scoop\apps\cmake\current\bin\cmake.exe -E rm -f CMakeFiles\RavisWorldEngine.dir/objects.a
-C:\Users\laser\scoop\apps\mingw\current\bin\ar.exe qc CMakeFiles\RavisWorldEngine.dir/objects.a @CMakeFiles\RavisWorldEngine.dir\objects1.rsp
-C:\Users\laser\scoop\apps\mingw\current\bin\c++.exe -Wl,--whole-archive CMakeFiles\RavisWorldEngine.dir/objects.a -Wl,--no-whole-archive -o RavisWorldEngine.exe -Wl,--out-implib,libRavisWorldEngine.dll.a -Wl,--major-image-version,0,--minor-image-version,0 @CMakeFiles\RavisWorldEngine.dir\linkLibs.rsp

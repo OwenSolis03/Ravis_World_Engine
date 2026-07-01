@@ -1,0 +1,68 @@
+# Build and CMake directories
+build/
+bin/
+lib/
+out/
+CMakeCache.txt
+CMakeFiles/
+CMakeScripts/
+Makefile
+cmake_install.cmake
+install_manifest.txt
+compile_commands.json
+CTestTestfile.cmake
+_deps/
+
+# Visual Studio / MSVC
+.vs/
+*.sln
+*.vcxproj
+*.vcxproj.filters
+*.vcxproj.user
+*.suo
+*.user
+*.pdb
+*.idb
+*.ilk
+*.exp
+*.lib
+*.dll
+*.exe
+*.obj
+*.o
+
+# MinGW / GCC / Clang
+*.a
+*.so
+*.dylib
+
+# Object files and caches
+*.cache
+.ninja_deps
+.ninja_log
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# VS Code / IDEs
+.vscode/
+.idea/
+
+# Editor artifacts
+*.swp
+*~
+*.bak
+
+# Agent cache and logs (if you prefer to ignore AI memory/context, uncomment these)
+#.agents/
+#.claude/
+#.gitnexus/
+#AGENTS.md
+#CLAUDE.md
+#Analisis_Claude.md

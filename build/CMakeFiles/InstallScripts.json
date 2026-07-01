@@ -1,9 +1,0 @@
-{
-	"InstallScripts" : 
-	[
-		"C:/Users/laser/Ravis_World_Engine/build/cmake_install.cmake",
-		"C:/Users/laser/Ravis_World_Engine/build/_deps/glfw-build/cmake_install.cmake",
-		"C:/Users/laser/Ravis_World_Engine/build/_deps/glfw-build/src/cmake_install.cmake"
-	],
-	"Parallel" : false
-}
