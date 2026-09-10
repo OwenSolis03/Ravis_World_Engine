@@ -1,5 +1,6 @@
 #include "../include/TectonicSimulator.h"
 #include "../include/MathUtils.h"
+#include "../include/Noise.h"
 #include <random>
 #include <queue>
 #include <iostream>
@@ -20,97 +21,30 @@ do { \
 } while(0)
 
 // ============================================================================
-// Hash-based 3D noise — NON-SEPARABLE, no mirror symmetry
-// Uses dot products with irrational vectors to mix all coordinates before sin()
+// 3D noise — thin wrappers over the shared coherent value noise in Noise.h.
+// The old sin-dot hash produced hexagonal / banded lattice artifacts on the
+// sphere; value noise is direction-free and spatially smooth. Device and host
+// share one implementation, so tectonics and climate stay in sync by
+// construction.
 // ============================================================================
 __device__ float hash_noise3d(float x, float y, float z) {
-    // Mix all three coordinates via dot products with large primes.
-    // The constant offsets break linear homogeneity so that noise(-p) is no
-    // longer tied to noise(p) — kills the antipodal (point-inversion) mirror.
-    // MUST stay identical to both cpu_hash_noise3d copies (tectonics/climate sync).
-    float d1 = x * 127.1f + y * 311.7f + z * 74.7f + 91.7f;
-    float d2 = x * 269.5f + y * 183.3f + z * 246.1f + 53.2f;
-    float d3 = x * 419.2f + y * 371.9f + z * 128.9f + 17.9f;
-    
-    float h1 = sinf(d1) * 43758.5453f;
-    float h2 = sinf(d2) * 22578.1459f;
-    float h3 = sinf(d3) * 10003.2987f;
-    
-    // Fractional parts give pseudo-random [-1, 1]
-    h1 = h1 - floorf(h1);
-    h2 = h2 - floorf(h2);
-    h3 = h3 - floorf(h3);
-    
-    return sinf(h1 * 6.2832f + h2 * 3.1416f + h3 * 1.5708f);
+    return rw_value_noise3d(x, y, z);
 }
 
-// FBM (Fractal Brownian Motion) — multi-octave noise for natural terrain
 __device__ float hash_fbm3d(float x, float y, float z, int octaves) {
-    float value = 0.0f;
-    float amplitude = 1.0f;
-    float frequency = 1.0f;
-    float total_amp = 0.0f;
-    
-    for (int i = 0; i < octaves; ++i) {
-        value += hash_noise3d(x * frequency, y * frequency, z * frequency) * amplitude;
-        total_amp += amplitude;
-        amplitude *= 0.5f;
-        frequency *= 2.0f;
-    }
-    return value / total_amp;
+    return rw_fbm3d(x, y, z, octaves);
 }
 
-// Ridge Noise (Fractal blending with 1.0 - abs(noise))
 __device__ float hash_ridge3d(float x, float y, float z, int octaves) {
-    float value = 0.0f;
-    float amplitude = 1.0f;
-    float frequency = 1.0f;
-    float total_amp = 0.0f;
-    
-    for (int i = 0; i < octaves; ++i) {
-        float n = hash_noise3d(x * frequency, y * frequency, z * frequency);
-        // Ridge formula
-        n = 1.0f - fabsf(n);
-        n *= n; // Sharpen ridges
-        value += n * amplitude;
-        total_amp += amplitude;
-        amplitude *= 0.5f;
-        frequency *= 2.0f;
-    }
-    return value / total_amp;
+    return rw_ridge3d(x, y, z, octaves);
 }
 
-// CPU-side equivalents for host code
 static float cpu_hash_noise3d(float x, float y, float z) {
-    // Constant offsets: see hash_noise3d (device). Must match it byte-for-byte.
-    float d1 = x * 127.1f + y * 311.7f + z * 74.7f + 91.7f;
-    float d2 = x * 269.5f + y * 183.3f + z * 246.1f + 53.2f;
-    float d3 = x * 419.2f + y * 371.9f + z * 128.9f + 17.9f;
-    
-    float h1 = std::sin(d1) * 43758.5453f;
-    float h2 = std::sin(d2) * 22578.1459f;
-    float h3 = std::sin(d3) * 10003.2987f;
-    
-    h1 = h1 - std::floor(h1);
-    h2 = h2 - std::floor(h2);
-    h3 = h3 - std::floor(h3);
-    
-    return std::sin(h1 * 6.2832f + h2 * 3.1416f + h3 * 1.5708f);
+    return rw_value_noise3d(x, y, z);
 }
 
 static float cpu_hash_fbm3d(float x, float y, float z, int octaves) {
-    float value = 0.0f;
-    float amplitude = 1.0f;
-    float frequency = 1.0f;
-    float total_amp = 0.0f;
-    
-    for (int i = 0; i < octaves; ++i) {
-        value += cpu_hash_noise3d(x * frequency, y * frequency, z * frequency) * amplitude;
-        total_amp += amplitude;
-        amplitude *= 0.5f;
-        frequency *= 2.0f;
-    }
-    return value / total_amp;
+    return rw_fbm3d(x, y, z, octaves);
 }
 
 // ============================================================================
@@ -357,7 +291,7 @@ __global__ void tectonic_apply_stress_kernel(
         float delta = 0.0f;
         if (s > 0.0f) { // Convergence (Mountains / Subduction)
             if (oceanic) delta = -falloff * 8000.0f * orogenesis_factor; // Oceanic Trench (Subduction)
-            else delta = falloff * 8000.0f * orogenesis_factor; // Continental Mountains (Himalayas/Andes)
+            else delta = falloff * 12000.0f * orogenesis_factor; // Continental Mountains (Himalayas/Andes)
         } else { // Divergence (Trenches / Ridges)
             if (oceanic) delta = -falloff * 4000.0f; // Mid-Ocean Ridges
             else delta = -falloff * 2000.0f; // Rift valleys
@@ -566,17 +500,19 @@ __global__ void tectonic_fbm_kernel(
     float ridge_hills = hash_ridge3d(spx * 8.0f, spy * 8.0f, spz * 8.0f, 5);
     
     // Scale ridges by tectonic stress (s usually maxes around 1.0 - 5.0)
-    float stress_multiplier = min(1.0f, s * 0.2f);
-    
+    float stress_multiplier = min(1.0f, s * 0.35f);
+
     float current_elev = elevation[i];
-    
+
     if (!is_oceanic[i]) {
         // Continental terrain
-        current_elev += low_noise * 500.0f; // Base continent shape (plateaus)
-        
-        // Add mountains ONLY where stress is high
-        current_elev += ridge_hills * 1500.0f * stress_multiplier;
-        current_elev += ridge_detail * 800.0f * stress_multiplier;
+        current_elev += low_noise * 750.0f; // Base continent shape (plateaus)
+
+        // Ridge structure: a base amount everywhere (ancient eroded ranges,
+        // hill country) plus a much larger stress-scaled component at active
+        // convergent boundaries.
+        current_elev += ridge_hills  * (450.0f + 3500.0f * stress_multiplier);
+        current_elev += ridge_detail * (180.0f + 1800.0f * stress_multiplier);
         
         // Add a tiny bit of basic noise everywhere so plains aren't perfectly smooth
         current_elev += hash_fbm3d(spx * 20.0f, spy * 20.0f, spz * 20.0f, 3) * 50.0f;
@@ -616,7 +552,6 @@ void TectonicSimulator::generatePlates(int numPlates, const SimulationParameters
 
     plates.resize(numPlates);
 
-    std::queue<size_t> bfsQueue;
     std::vector<bool> visited(cells.size(), false);
 
     // --- Primary clustering: generate a "Pangea pole" for continental seed attraction ---
@@ -640,9 +575,11 @@ void TectonicSimulator::generatePlates(int numPlates, const SimulationParameters
         
         size_t seedId;
         if (!is_oceanic_plate) {
-            // Continental plates: bias seed placement toward clustering poles
-            float cluster_strength = params.primary_clustering;
-            float secondary_strength = params.secondary_clustering;
+            // Continental plates: bias seed placement toward clustering poles.
+            // Scaled down: with few continental plates the raw slider value
+            // fused every continent into one supercontinent.
+            float cluster_strength = params.primary_clustering * 0.6f;
+            float secondary_strength = params.secondary_clustering * 0.6f;
             
             size_t best = distNode(rng);
             float best_score = 1e10f;
@@ -680,7 +617,6 @@ void TectonicSimulator::generatePlates(int numPlates, const SimulationParameters
         
         visited[seedId] = true;
         cells[seedId].plate_id = i;
-        bfsQueue.push(seedId);
 
         plates[i].is_oceanic = is_oceanic_plate;
         plates[i].center = cells[seedId].position;
@@ -694,89 +630,66 @@ void TectonicSimulator::generatePlates(int numPlates, const SimulationParameters
         }
     }
 
-    // Grow Major Plates
-    while (!bfsQueue.empty()) {
-        size_t currentId = bfsQueue.front();
-        bfsQueue.pop();
-
-        int currentPlate = cells[currentId].plate_id;
-
-        for (size_t neighborId : cells[currentId].neighbors) {
-            if (!visited[neighborId]) {
-                visited[neighborId] = true;
-                cells[neighborId].plate_id = currentPlate;
-                bfsQueue.push(neighborId);
+    // Assign every cell to the nearest plate seed, measured from a
+    // noise-warped position: continuous-space Voronoi with domain warping.
+    // Boundaries come out as smooth organic curves with no lattice/hexagon
+    // artifacts (BFS / region-growing on the triangular cell graph produces
+    // hexagons no matter how it's jittered). crust_warping controls how far
+    // the boundaries wander from a clean Voronoi diagram.
+    auto assign_warped_voronoi = [&](int nseeds) {
+        const float wa = 0.06f + 0.30f * params.crust_warping; // warp amplitude
+        for (auto& cell : cells) {
+            float px = static_cast<float>(cell.position.x);
+            float py = static_cast<float>(cell.position.y);
+            float pz = static_cast<float>(cell.position.z);
+            float wx = px + wa * cpu_hash_fbm3d(px * 2.4f + 11.3f, py * 2.4f,         pz * 2.4f,         4);
+            float wy = py + wa * cpu_hash_fbm3d(px * 2.4f,         py * 2.4f + 24.7f,  pz * 2.4f,         4);
+            float wz = pz + wa * cpu_hash_fbm3d(px * 2.4f,         py * 2.4f,          pz * 2.4f + 39.1f, 4);
+            int best = 0;
+            float best_d = 1e30f;
+            for (int p = 0; p < nseeds; ++p) {
+                float dx = wx - static_cast<float>(plates[p].center.x);
+                float dy = wy - static_cast<float>(plates[p].center.y);
+                float dz = wz - static_cast<float>(plates[p].center.z);
+                float d = dx * dx + dy * dy + dz * dz;
+                if (d < best_d) { best_d = d; best = p; }
             }
+            cell.plate_id = best;
         }
-    }
+    };
 
-    // Find boundaries of major plates
+    // Major plates first, so minor-plate seeds land on real boundaries.
+    assign_warped_voronoi(numMajor);
+
+    // Find boundaries of the major plates
     std::vector<size_t> boundary_cells;
     for (size_t i = 0; i < cells.size(); ++i) {
         int pid = cells[i].plate_id;
-        bool is_boundary = false;
         for (size_t nid : cells[i].neighbors) {
-            if (cells[nid].plate_id != pid) {
-                is_boundary = true;
-                break;
-            }
+            if (cells[nid].plate_id != pid) { boundary_cells.push_back(i); break; }
         }
-        if (is_boundary) boundary_cells.push_back(i);
     }
 
-    // Spawn Minor Plates on boundaries
+    // Seed minor plates (fast-moving fragments) on the boundaries, then do the
+    // final assignment over every plate.
     if (!boundary_cells.empty()) {
         std::uniform_int_distribution<size_t> distBoundary(0, boundary_cells.size() - 1);
-        std::vector<bool> minor_visited(cells.size(), false);
-        
         for (int i = numMajor; i < numPlates; ++i) {
             size_t seedId = boundary_cells[distBoundary(rng)];
-            
-            cells[seedId].plate_id = i;
-            minor_visited[seedId] = true;
-            bfsQueue.push(seedId);
-
             plates[i].is_oceanic = distProb(rng) > params.crust_fraction;
             plates[i].center = cells[seedId].position;
             Vector3 axis(distReal(rng), distReal(rng), distReal(rng));
             plates[i].rotation_axis = Math::normalize(axis);
-            
-            // Minor plates tend to move faster (fragments)
             if (plates[i].is_oceanic) {
                 plates[i].angular_speed = distProb(rng) * speed_scale * 0.3f + 0.01f;
             } else {
                 plates[i].angular_speed = distProb(rng) * speed_scale * 0.15f + 0.005f;
             }
         }
-
-        // Grow Minor Plates for a limited number of steps
-        int max_minor_steps = static_cast<int>(std::sqrt(cells.size()) * 0.05f); // Limit growth
-        int current_step = 0;
-        
-        while (!bfsQueue.empty() && current_step < max_minor_steps) {
-            int level_size = bfsQueue.size();
-            for (int k = 0; k < level_size; ++k) {
-                size_t currentId = bfsQueue.front();
-                bfsQueue.pop();
-
-                int currentPlate = cells[currentId].plate_id;
-
-                for (size_t neighborId : cells[currentId].neighbors) {
-                    if (!minor_visited[neighborId]) {
-                        minor_visited[neighborId] = true;
-                        cells[neighborId].plate_id = currentPlate;
-                        bfsQueue.push(neighborId);
-                    }
-                }
-            }
-            current_step++;
-        }
-        
-        // Clear remaining queue
-        while (!bfsQueue.empty()) bfsQueue.pop();
+        assign_warped_voronoi(numPlates);
     }
 
-    std::uniform_real_distribution<float> distAge(10.0f, 200.0f); 
+    std::uniform_real_distribution<float> distAge(10.0f, 200.0f);
     std::uniform_real_distribution<float> distOceanVar(0.0f, 500.0f);
     std::uniform_real_distribution<float> distContVar(0.0f, 200.0f);
     
@@ -804,9 +717,9 @@ void TectonicSimulator::generatePlates(int numPlates, const SimulationParameters
             float warp_noise = cpu_hash_noise3d(px * 3.0f + 100.0f, py * 3.0f + 200.0f, pz * 3.0f + 300.0f);
             ridge += std::abs(warp_noise) * warp;
             // Flatten plains by applying a power curve. Low values stay low, high values spike up.
-            ridge = std::pow(ridge, 2.5f);
-            
-            cell.elevation = 50.0f + ridge * 2500.0f + distContVar(rng);
+            ridge = std::pow(ridge, 1.9f);
+
+            cell.elevation = 50.0f + ridge * 3000.0f + distContVar(rng);
             cell.bedrock = RockType::GRANITE;
             cell.crustal_thickness = 35.0f + (cell.elevation - 100.0f) / 100.0f; // Isostatic equilibrium
             cell.crustal_age = 2500.0f;     
@@ -828,107 +741,106 @@ void TectonicSimulator::generatePlates(int numPlates, const SimulationParameters
     // No longer using blocky BFS uplifts. Replaced by FBM kernel in simulate().
 }
 
+// Adds the discrete "terrain feature" knobs (superswells, ancient ranges,
+// hills, uplands, stochastic uplifts) on top of the tectonic base. Runs after
+// simulate() so it shapes the final terrain; erosion then works it down.
+// Each feature is a noise-warped radial dome, not a BFS flood fill — flood
+// fill on the triangular cell graph produces hexagons.
 void TectonicSimulator::applyTerrainFeatures(const SimulationParameters& params) {
     auto& cells = planet.getCells();
+    if (cells.empty()) return;
+
     std::mt19937 rng(params.seed + 7777);
-    std::uniform_int_distribution<size_t> distNode(0, cells.size() - 1);
+    std::uniform_real_distribution<float> distReal(-1.0f, 1.0f);
     std::uniform_real_distribution<float> distProb(0.0f, 1.0f);
-    
-    // Helper: BFS radial spread from a seed cell on continental crust
-    auto bfs_uplift = [&](size_t seed, float peak_elev, float min_elev, int spread_cells) {
-        if (cells[seed].is_oceanic) return;
-        
-        std::queue<size_t> q;
-        std::vector<bool> vis(cells.size(), false);
-        q.push(seed);
-        vis[seed] = true;
-        int count = 0;
-        
-        while (!q.empty() && count < spread_cells) {
-            size_t cur = q.front(); q.pop();
-            if (cells[cur].is_oceanic) continue;
-            
-            float t = static_cast<float>(count) / static_cast<float>(spread_cells);
-            float uplift = peak_elev * (1.0f - t) + min_elev * t;
-            
-            // Hash noise for organic shape
-            float px = static_cast<float>(cells[cur].position.x);
-            float py = static_cast<float>(cells[cur].position.y);
-            float pz = static_cast<float>(cells[cur].position.z);
-            float noise = cpu_hash_noise3d(px * 10.0f, py * 10.0f, pz * 10.0f);
-            uplift *= (0.7f + 0.3f * std::abs(noise));
-            
-            cells[cur].elevation += uplift;
-            cells[cur].crustal_thickness += uplift / 100.0f;
-            count++;
-            
-            for (size_t nid : cells[cur].neighbors) {
-                if (!vis[nid] && !cells[nid].is_oceanic) {
-                    vis[nid] = true;
-                    q.push(nid);
-                }
-            }
+
+    // ang_radius: chord radius on the unit sphere (0.10 ~ 6 deg, 0.55 ~ 33 deg).
+    auto add_dome = [&](float ang_radius, float peak, float rim, bool land_only) {
+        Vector3 c = Math::normalize(Vector3(distReal(rng), distReal(rng), distReal(rng)));
+        float phase = distProb(rng) * 100.0f;
+        for (auto& cell : cells) {
+            if (land_only && cell.is_oceanic) continue;
+            float px = static_cast<float>(cell.position.x);
+            float py = static_cast<float>(cell.position.y);
+            float pz = static_cast<float>(cell.position.z);
+            float dx = px - static_cast<float>(c.x);
+            float dy = py - static_cast<float>(c.y);
+            float dz = pz - static_cast<float>(c.z);
+            float chord = std::sqrt(dx * dx + dy * dy + dz * dz);
+
+            // Irregular outline: wobble the effective radius with low-freq noise.
+            float wob = cpu_hash_fbm3d(px * 4.0f + phase, py * 4.0f, pz * 4.0f, 3); // [-1,1]
+            float r = ang_radius * (1.0f + 0.4f * wob);
+            if (chord >= r) continue;
+
+            float t = chord / r;                      // 0 centre .. 1 edge
+            float falloff = (1.0f - t) * (1.0f - t);  // smooth dome
+            float uplift = peak * falloff + rim * (1.0f - falloff);
+            uplift *= 0.75f + 0.25f * std::abs(cpu_hash_noise3d(px * 13.0f, py * 13.0f, pz * 13.0f));
+
+            cell.elevation += uplift;
+            if (!cell.is_oceanic) cell.crustal_thickness += uplift / 120.0f;
         }
     };
-    
-    // Old mountains (Appalachian-style): moderate height, large spread
-    for (int i = 0; i < params.old_mountain_freq; ++i) {
-        size_t seed;
-        int tries = 0;
-        do { seed = distNode(rng); tries++; } while (cells[seed].is_oceanic && tries < 100);
-        bfs_uplift(seed, 1200.0f, 400.0f, 200);
-    }
-    
-    // Old hills (Caledonian-style): low height, medium spread
-    for (int i = 0; i < params.old_hill_freq; ++i) {
-        size_t seed;
-        int tries = 0;
-        do { seed = distNode(rng); tries++; } while (cells[seed].is_oceanic && tries < 100);
-        bfs_uplift(seed, 600.0f, 150.0f, 100);
-    }
-    
-    // Small uplifts: tiny stochastic bumps
-    for (int i = 0; i < params.small_uplift_freq; ++i) {
-        size_t seed;
-        int tries = 0;
-        do { seed = distNode(rng); tries++; } while (cells[seed].is_oceanic && tries < 100);
-        bfs_uplift(seed, 400.0f, 100.0f, 30);
-    }
-    
-    // Uplands (Volga-style): very broad, very gentle
-    for (int i = 0; i < params.upland_freq; ++i) {
-        size_t seed;
-        int tries = 0;
-        do { seed = distNode(rng); tries++; } while (cells[seed].is_oceanic && tries < 100);
-        bfs_uplift(seed, 350.0f, 100.0f, 400);
-    }
-    
-    // Superswells (African-style): massive broad doming, also affects oceanic crust
-    for (int i = 0; i < params.superswell_freq; ++i) {
-        size_t seed = distNode(rng);
-        std::queue<size_t> q;
-        std::vector<bool> vis(cells.size(), false);
-        q.push(seed);
-        vis[seed] = true;
-        int count = 0;
-        int spread = 600;
-        
-        while (!q.empty() && count < spread) {
-            size_t cur = q.front(); q.pop();
-            float t = static_cast<float>(count) / static_cast<float>(spread);
-            float uplift = 800.0f * (1.0f - t * t); // Gaussian-like falloff
-            cells[cur].elevation += uplift;
-            if (!cells[cur].is_oceanic) cells[cur].crustal_thickness += uplift / 200.0f;
-            count++;
-            
-            for (size_t nid : cells[cur].neighbors) {
-                if (!vis[nid]) {
-                    vis[nid] = true;
-                    q.push(nid);
-                }
-            }
+
+    // Linear range: uplift along a great-circle arc so it reads as a cordillera
+    // rather than a circular blob. arc_len in radians, half_width chord units.
+    auto add_ridge = [&](float arc_len, float half_width, float peak, float rim, bool land_only) {
+        Vector3 a = Math::normalize(Vector3(distReal(rng), distReal(rng), distReal(rng)));
+        Vector3 dir = Math::normalize(Vector3(distReal(rng), distReal(rng), distReal(rng)));
+        // component of dir tangent to the sphere at a
+        double adot = a.x * dir.x + a.y * dir.y + a.z * dir.z;
+        Vector3 tang = Math::normalize(Vector3(dir.x - adot * a.x,
+                                               dir.y - adot * a.y,
+                                               dir.z - adot * a.z));
+        float cs = std::cos(arc_len), sn = std::sin(arc_len);
+        Vector3 b = Math::normalize(Vector3(a.x * cs + tang.x * sn,
+                                            a.y * cs + tang.y * sn,
+                                            a.z * cs + tang.z * sn));
+        float abx = static_cast<float>(b.x - a.x);
+        float aby = static_cast<float>(b.y - a.y);
+        float abz = static_cast<float>(b.z - a.z);
+        float ab2 = abx * abx + aby * aby + abz * abz + 1e-9f;
+        float phase = distProb(rng) * 100.0f;
+
+        for (auto& cell : cells) {
+            if (land_only && cell.is_oceanic) continue;
+            float px = static_cast<float>(cell.position.x);
+            float py = static_cast<float>(cell.position.y);
+            float pz = static_cast<float>(cell.position.z);
+            // distance to the chord segment a..b
+            float apx = px - static_cast<float>(a.x);
+            float apy = py - static_cast<float>(a.y);
+            float apz = pz - static_cast<float>(a.z);
+            float u = (apx * abx + apy * aby + apz * abz) / ab2;
+            u = std::max(0.0f, std::min(1.0f, u));
+            float dx = apx - abx * u, dy = apy - aby * u, dz = apz - abz * u;
+            float d = std::sqrt(dx * dx + dy * dy + dz * dz);
+
+            float wob = cpu_hash_fbm3d(px * 5.0f + phase, py * 5.0f, pz * 5.0f, 3); // [-1,1]
+            float w = half_width * (1.0f + 0.5f * wob);
+            if (d >= w) continue;
+
+            float t = d / w;
+            float falloff = (1.0f - t) * (1.0f - t);
+            float uplift = peak * falloff + rim * (1.0f - falloff);
+            uplift *= 0.7f + 0.3f * std::abs(cpu_hash_noise3d(px * 14.0f, py * 14.0f, pz * 14.0f));
+
+            cell.elevation += uplift;
+            if (!cell.is_oceanic) cell.crustal_thickness += uplift / 120.0f;
         }
-    }
+    };
+
+    // Superswells (African-style): broad, gentle, also lifts ocean floor.
+    for (int i = 0; i < params.superswell_freq; ++i)  add_dome(0.55f,  900.0f,   0.0f, false);
+    // Old mountains (Appalachian/Ural-style): long inland cordilleras.
+    for (int i = 0; i < params.old_mountain_freq; ++i) add_ridge(0.60f, 0.075f, 2600.0f, 300.0f, true);
+    // Old hills (Caledonian-style): shorter, lower linear ridges.
+    for (int i = 0; i < params.old_hill_freq; ++i)     add_ridge(0.40f, 0.060f,  950.0f, 120.0f, true);
+    // Small stochastic uplifts.
+    for (int i = 0; i < params.small_uplift_freq; ++i) add_dome(0.09f,  500.0f,  80.0f, true);
+    // Uplands (Volga-style): very broad, very gentle.
+    for (int i = 0; i < params.upland_freq; ++i)       add_dome(0.40f,  420.0f, 120.0f, true);
 }
 
 void TectonicSimulator::generateHotspots(const SimulationParameters& params) {
@@ -1112,8 +1024,10 @@ void TectonicSimulator::simulate(int iterations, const SimulationParameters& par
         );
         CHECK_CUDA(cudaDeviceSynchronize());
 
-        // Diffuse stress inland to create smooth falloff (20 iterations)
-        for (int i = 0; i < 20; ++i) {
+        // Diffuse stress inland to create smooth falloff. More passes = uplift
+        // reaches further from the plate boundary, so mountain belts have broad
+        // flanks / foothills instead of a thin coastal ridge.
+        for (int i = 0; i < 40; ++i) {
             tectonic_diffuse_stress_kernel<<<numBlocks, blockSize>>>(
                 num_cells, d_stress, d_next_stress, d_neighbors, d_num_neighbors
             );
@@ -1186,10 +1100,56 @@ void TectonicSimulator::simulate(int iterations, const SimulationParameters& par
         cells[i].is_oceanic = (h_is_oceanic[i] == 1);
         cells[i].crustal_age = h_crustal_age[i];
         cells[i].plate_velocity = Vector3(h_vel_x[i], h_vel_y[i], h_vel_z[i]);
-        if (cells[i].elevation > 5000.0f) { 
+        if (cells[i].elevation > 5000.0f) {
             cells[i].bedrock = RockType::METAMORPHIC;
         }
     }
+
+    // Remove landlocked deep basins: flood-fill ocean cells, keep the largest
+    // connected body as the "world ocean"; any other ocean region (a small
+    // oceanic plate that ended up enclosed by continents) is raised to a
+    // shallow inland-sea depth so subdivided worlds don't show 4-10 km abysses
+    // sitting inside a landmass.
+    {
+        const float sea = params.effective_sea_level();
+        std::vector<int> comp(num_cells, -1);
+        std::vector<int> compSize;
+        std::queue<int> fq;
+        for (int i = 0; i < num_cells; ++i) {
+            if (cells[i].elevation > sea || comp[i] != -1) continue;
+            int id = static_cast<int>(compSize.size());
+            int sz = 0;
+            comp[i] = id;
+            fq.push(i);
+            while (!fq.empty()) {
+                int c = fq.front(); fq.pop();
+                ++sz;
+                for (size_t nid : cells[c].neighbors) {
+                    if (cells[nid].elevation <= sea && comp[nid] == -1) {
+                        comp[nid] = id;
+                        fq.push(static_cast<int>(nid));
+                    }
+                }
+            }
+            compSize.push_back(sz);
+        }
+        if (compSize.size() > 1) {
+            int mainComp = 0;
+            for (int c = 1; c < static_cast<int>(compSize.size()); ++c)
+                if (compSize[c] > compSize[mainComp]) mainComp = c;
+            // Everything that is not the one world ocean becomes a shallow
+            // inland sea rather than a deep basin.
+            const float inland_floor = sea - 60.0f;
+            for (int i = 0; i < num_cells; ++i) {
+                if (comp[i] != -1 && comp[i] != mainComp && cells[i].elevation < inland_floor)
+                    cells[i].elevation = inland_floor;
+            }
+        }
+    }
+
+    // Discrete terrain-feature knobs (superswells, ancient ranges/hills,
+    // uplands, stochastic uplifts) applied on top of the tectonic base.
+    applyTerrainFeatures(params);
 
     cudaFree(d_pos_x); cudaFree(d_pos_y); cudaFree(d_pos_z);
     cudaFree(d_elev); cudaFree(d_next_elev);
