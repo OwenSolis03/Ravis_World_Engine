@@ -139,6 +139,7 @@ static void logWorldStats(const GoldbergPolyhedron &planet,
   size_t lakeCells = 0, riverCells = 0;
   std::map<std::string, size_t> biomeCount;
   std::array<size_t, 5> rockCount{};
+  std::array<size_t, 4> soilCount{};
 
   for (const auto &c : cells) {
     tSum += c.temperature;
@@ -163,6 +164,9 @@ static void logWorldStats(const GoldbergPolyhedron &planet,
 
     if (c.elevation > sea) {
       land++;
+      int si = static_cast<int>(c.soil);
+      if (si >= 0 && si < 4)
+        soilCount[si]++;
       float e = static_cast<float>(c.elevation - sea);
       landElevSum += e;
       landElev.push_back(e);
@@ -284,6 +288,12 @@ static void logWorldStats(const GoldbergPolyhedron &planet,
   for (int i = 0; i < 5; ++i)
     o << "  " << std::left << std::setw(22) << rockNames[i] << std::right
       << rockCount[i] << " (" << pctN(rockCount[i]) << "%)\n";
+
+  static const char *soilNames[4] = {"None", "Sand", "Clay", "Loam"};
+  o << "-- Soil (land) --\n";
+  for (int i = 0; i < 4; ++i)
+    o << "  " << std::left << std::setw(22) << soilNames[i] << std::right
+      << soilCount[i] << " (" << pctL(soilCount[i]) << "%)\n";
   o << "\n";
 
   std::cout << o.str() << std::flush;
@@ -332,6 +342,7 @@ void runSimulation(SimulationParameters params) {
   atmosphere.assignBiomes(params);
 
   PedologySimulator pedology(*new_planet);
+  pedology.classifyBedrock(params); // refine rock types from relief + climate
   pedology.generateSoils(params);
 
   // Record parameters + diagnostics for this world (stdout + worldgen.log)
@@ -850,22 +861,8 @@ int main() {
                     else if (cell.temperature < 0.2f && !is_steep) { r=240/255.f; g=240/255.f; b=240/255.f; } // Snow
                     else if (cell.temperature < 0.2f && is_steep) { r=80/255.f; g=80/255.f; b=80/255.f; } // Exposed steep rock
                     else {
-                        struct BP { float t, p; float r, g, b; };
-                        BP biomes[] = {
-                            {0.2f, 0.1f, 160/255.f, 160/255.f, 120/255.f}, {0.2f, 0.4f, 140/255.f, 150/255.f, 100/255.f}, {0.3f, 0.7f, 90/255.f, 120/255.f, 90/255.f}, {0.3f, 0.9f, 50/255.f, 90/255.f, 60/255.f},
-                            {0.5f, 0.1f, 210/255.f, 180/255.f, 140/255.f}, {0.6f, 0.3f, 180/255.f, 180/255.f, 90/255.f}, {0.5f, 0.6f, 120/255.f, 180/255.f, 90/255.f}, {0.6f, 0.9f, 34/255.f, 139/255.f, 34/255.f},
-                            {0.9f, 0.1f, 237/255.f, 201/255.f, 175/255.f}, {0.8f, 0.3f, 200/255.f, 180/255.f, 100/255.f}, {0.9f, 0.5f, 154/255.f, 205/255.f, 50/255.f}, {0.8f, 0.7f, 100/255.f, 160/255.f, 40/255.f}, {0.9f, 0.9f, 0/255.f, 100/255.f, 0/255.f}
-                        };
-                        float min_dist = 1e10f;
-                        for (const auto& bp : biomes) {
-                            float dt = cell.temperature - bp.t;
-                            float dp = cell.precipitation - bp.p;
-                            float dist = dt*dt + dp*dp;
-                            if (dist < min_dist) {
-                                min_dist = dist;
-                                r = bp.r; g = bp.g; b = bp.b;
-                            }
-                        }
+                        // Whittaker biome assigned by AtmosphereSimulator::assignBiomes
+                        biomeRGB(cell.biome, r, g, b);
                     }
                 } else if (active_map_index == 5) { // Temperature
                     float t = std::max(0.0f, std::min(1.0f, cell.temperature));
