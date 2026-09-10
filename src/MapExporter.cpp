@@ -13,33 +13,6 @@ namespace Ravis {
 
 struct Color { unsigned char r, g, b; };
 
-struct BiomePoint {
-    float temp;
-    float precip;
-    Color color;
-};
-
-const BiomePoint biomes[] = {
-    // Cold
-    { 0.2f, 0.1f, {160, 160, 120} }, // Cold Desert
-    { 0.2f, 0.4f, {140, 150, 100} }, // Steppe / Tundra
-    { 0.3f, 0.7f, {90, 120, 90} },   // Boreal Forest
-    { 0.3f, 0.9f, {50, 90, 60} },    // Temperate Rainforest (Cold)
-
-    // Temperate
-    { 0.5f, 0.1f, {210, 180, 140} }, // Desert
-    { 0.6f, 0.3f, {180, 180, 90} },  // Mediterranean / Shrubland
-    { 0.5f, 0.6f, {120, 180, 90} },  // Temperate Forest
-    { 0.6f, 0.9f, {34, 139, 34} },   // Temperate Rainforest
-
-    // Tropical
-    { 0.9f, 0.1f, {237, 201, 175} }, // Hot Desert
-    { 0.8f, 0.3f, {200, 180, 100} }, // Thorn Scrub
-    { 0.9f, 0.5f, {154, 205, 50} },  // Savanna
-    { 0.8f, 0.7f, {100, 160, 40} },  // Tropical Dry Forest
-    { 0.9f, 0.9f, {0, 100, 0} }      // Tropical Rainforest
-};
-
 Color getBiomeColor(float temp, float precip, float elevation, float sea_level) {
     if (elevation <= sea_level) {
         float depth = 1.0f - std::max(0.0f, std::min(1.0f, (elevation + 10000.0f) / (sea_level + 10000.0f)));
@@ -50,23 +23,13 @@ Color getBiomeColor(float temp, float precip, float elevation, float sea_level) 
                  static_cast<unsigned char>(100 + 100 * (1.0f - depth)) };
     }
     
-    // Explicit ice overlay for land
-    if (temp < 0.2f) return { 240, 240, 240 }; // Ice cap / Glacier
-    
-    // Euclidean Whittaker diagram search
-    float min_dist = 1e10f;
-    Color best_color = {0, 0, 0};
-    
-    for (const auto& b : biomes) {
-        float dt = temp - b.temp;
-        float dp = precip - b.precip;
-        float dist = dt*dt + dp*dp;
-        if (dist < min_dist) {
-            min_dist = dist;
-            best_color = b.color;
-        }
-    }
-    return best_color;
+    // Whittaker classification shared with the simulation + 3D render
+    float tempC = temp * 55.0f - 15.0f;
+    float r, g, b;
+    biomeRGB(classifyBiome(tempC, precip), r, g, b);
+    return { static_cast<unsigned char>(r * 255.0f),
+             static_cast<unsigned char>(g * 255.0f),
+             static_cast<unsigned char>(b * 255.0f) };
 }
 
 // External CUDA function declaration

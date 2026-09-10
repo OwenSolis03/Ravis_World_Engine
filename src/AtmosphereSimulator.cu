@@ -1,6 +1,7 @@
 #define _USE_MATH_DEFINES
 #include "../include/AtmosphereSimulator.h"
 #include "../include/MathUtils.h"
+#include "../include/Noise.h"
 #include <cmath>
 #include <algorithm>
 #include <iostream>
@@ -12,39 +13,9 @@
 
 namespace Ravis {
 
-// CPU-side noise for climate distortion
-static float cpu_hash_noise3d(float x, float y, float z) {
-    // Constant offsets break linear homogeneity so noise(-p) is not tied to
-    // noise(p) (antipodal mirror). MUST match hash_noise3d / cpu_hash_noise3d
-    // in TectonicSimulator.cu byte-for-byte so tectonics and climate agree.
-    float d1 = x * 127.1f + y * 311.7f + z * 74.7f + 91.7f;
-    float d2 = x * 269.5f + y * 183.3f + z * 246.1f + 53.2f;
-    float d3 = x * 419.2f + y * 371.9f + z * 128.9f + 17.9f;
-    
-    float h1 = std::sin(d1) * 43758.5453f;
-    float h2 = std::sin(d2) * 22578.1459f;
-    float h3 = std::sin(d3) * 10003.2987f;
-    
-    h1 = h1 - std::floor(h1);
-    h2 = h2 - std::floor(h2);
-    h3 = h3 - std::floor(h3);
-    
-    return std::sin(h1 * 6.2832f + h2 * 3.1416f + h3 * 1.5708f);
-}
-
+// Climate distortion noise — shared coherent value noise (see Noise.h).
 static float cpu_hash_fbm3d(float x, float y, float z, int octaves) {
-    float value = 0.0f;
-    float amplitude = 1.0f;
-    float frequency = 1.0f;
-    float total_amp = 0.0f;
-    
-    for (int i = 0; i < octaves; ++i) {
-        value += cpu_hash_noise3d(x * frequency, y * frequency, z * frequency) * amplitude;
-        total_amp += amplitude;
-        amplitude *= 0.5f;
-        frequency *= 2.0f;
-    }
-    return value / total_amp;
+    return rw_fbm3d(x, y, z, octaves);
 }
 
 #define CHECK_CUDA(call) \
@@ -166,7 +137,7 @@ void AtmosphereSimulator::calculatePrimaryClimate(const SimulationParameters& pa
     for (auto& cell : cells) {
         // Distort latitude with low-frequency noise for precipitation
         float noise = cpu_hash_fbm3d(cell.position.x * 2.0f, cell.position.y * 2.0f, cell.position.z * 2.0f, 3);
-        float distorted_lat = cell.latitude + noise * 0.3f; 
+        float distorted_lat = cell.latitude + noise * 0.16f;
         float lat_deg = std::abs(distorted_lat) * 180.0f / 3.14159265359f;
         
         float moisture_base = 0.0f;
@@ -210,22 +181,27 @@ void AtmosphereSimulator::calculateTemperatures(const SimulationParameters& para
     float axial_tilt = 23.0f * 3.14159265359f / 180.0f; 
     
     for (auto& cell : cells) {
-        // Add low-frequency FBM noise to undulate the isotherms organically
+        // Undulate the isotherms organically. hash_fbm3d is hash-based (not
+        // smooth Perlin) so it is effectively per-cell jitter; keep the weight
+        // small and rely on the smoothing passes below for spatial coherence.
         float noise = cpu_hash_fbm3d(cell.position.x * 2.5f, cell.position.y * 2.5f, cell.position.z * 2.5f, 3);
-        
+
         // Calculate thermal latitude (apply tilt and noise)
-        float thermal_lat = cell.latitude + axial_tilt * 0.5f + noise * 0.2f; 
+        float thermal_lat = cell.latitude + axial_tilt * 0.5f + noise * 0.06f;
         // Clamp to poles
         thermal_lat = std::max(-3.14159265359f/2.0f, std::min(3.14159265359f/2.0f, thermal_lat));
         
         float latFactor = std::cos(thermal_lat);
-        float baseTemp = latFactor; 
-        
+        // Scale + shift so the area-weighted global mean lands near Earth's
+        // ~14 C (normalized ~0.53) with hot tropics (~28 C) and cold poles,
+        // without freezing 40% of the land. temp_offset / LGM ride on top.
+        float baseTemp = latFactor * 1.15f - 0.33f;
+
         float elevAboveSea = cell.elevation - effective_sea;
         if (elevAboveSea < 0) elevAboveSea = 0;
-        
-        float lapseRate = elevAboveSea * 0.00012f; // Mountains are colder
-        
+
+        float lapseRate = elevAboveSea * 0.00009f; // ~5 C/km - mountains are colder
+
         cell.temperature = baseTemp - lapseRate + params.temp_offset + lgm_offset;
         
         // Oceans have higher heat capacity (moderated temperatures)
@@ -235,6 +211,22 @@ void AtmosphereSimulator::calculateTemperatures(const SimulationParameters& para
         
         if (cell.temperature < 0.0f) cell.temperature = 0.0f;
         if (cell.temperature > 1.0f) cell.temperature = 1.0f;
+    }
+
+    // Smooth the isotherm field so biome bands are spatially coherent instead of
+    // inheriting the per-cell hash jitter from the noise term above.
+    for (int pass = 0; pass < 2; ++pass) {
+        std::vector<float> tmp(cells.size());
+        for (size_t i = 0; i < cells.size(); ++i) {
+            float sum = cells[i].temperature;
+            float count = 1.0f;
+            for (size_t nid : cells[i].neighbors) {
+                sum += cells[nid].temperature;
+                count += 1.0f;
+            }
+            tmp[i] = sum / count;
+        }
+        for (size_t i = 0; i < cells.size(); ++i) cells[i].temperature = tmp[i];
     }
 }
 
@@ -424,7 +416,26 @@ void AtmosphereSimulator::simulateMoisture(int iterations, const SimulationParam
     // Normalize precipitation by a fixed "reasonable maximum" rather than the absolute global maximum.
     // This prevents a single outlier mountain cell from destroying the world's biomes.
     for (auto& cell : cells) {
-        cell.precipitation = std::min(1.0f, cell.precipitation / 3.0f);        
+        cell.precipitation = std::min(1.0f, cell.precipitation / 3.0f);
+    }
+
+    // Smooth precipitation so the Whittaker classifier sees coherent regions
+    // instead of cell-to-cell spikes from wind advection / orography. Single
+    // self-weighted pass: enough to break the checkerboard without averaging
+    // the dry spots (deserts) up into their wetter neighbours.
+    {
+        std::vector<float> tmp(cells.size());
+        for (size_t i = 0; i < cells.size(); ++i) {
+            float sum = 0.0f;
+            float count = 0.0f;
+            for (size_t nid : cells[i].neighbors) {
+                sum += cells[nid].precipitation;
+                count += 1.0f;
+            }
+            float nbrMean = count > 0.0f ? sum / count : cells[i].precipitation;
+            tmp[i] = 0.5f * cells[i].precipitation + 0.5f * nbrMean;
+        }
+        for (size_t i = 0; i < cells.size(); ++i) cells[i].precipitation = tmp[i];
     }
 }
 
@@ -440,35 +451,7 @@ void AtmosphereSimulator::assignBiomes(const SimulationParameters& params) {
         }
 
         float temp_c = cells[i].temperature * 55.0f - 15.0f;
-        float biotemp = std::max(0.0f, std::min(30.0f, temp_c));
-        float precip_mm = cells[i].precipitation * 8000.0f;
-        float pet = biotemp * 58.93f;
-        float pet_ratio = pet / (precip_mm + 1e-3f);
-
-        BiomeType b;
-        if (biotemp < 1.5f) b = BiomeType::ICE;
-        else if (biotemp < 3.0f) b = BiomeType::TUNDRA;
-        else if (biotemp < 12.0f) {
-            if (pet_ratio > 2.0f) b = BiomeType::DESERT;
-            else if (pet_ratio > 1.0f) b = BiomeType::STEPPE;
-            else if (pet_ratio > 0.5f) b = BiomeType::BOREAL_FOREST;
-            else b = BiomeType::TEMPERATE_RAINFOREST;
-        } else if (biotemp < 24.0f) {
-            if (pet_ratio > 2.0f) {
-                if (precip_mm < 250.0f) b = BiomeType::DESERT;
-                else b = BiomeType::THORN_SCRUB;
-            }
-            else if (pet_ratio > 1.0f) b = BiomeType::MEDITERRANEAN;
-            else if (pet_ratio > 0.5f) b = BiomeType::TEMPERATE_FOREST;
-            else b = BiomeType::TEMPERATE_RAINFOREST;
-        } else {
-            if (pet_ratio > 4.0f) b = BiomeType::DESERT;
-            else if (pet_ratio > 2.0f) b = BiomeType::THORN_SCRUB;
-            else if (pet_ratio > 1.0f) b = BiomeType::SAVANNA;
-            else if (pet_ratio > 0.5f) b = BiomeType::TROPICAL_DRY_FOREST;
-            else b = BiomeType::RAINFOREST;
-        }
-        ideal_biomes[i] = b;
+        ideal_biomes[i] = classifyBiome(temp_c, cells[i].precipitation);
     }
 
     // Assign ideal biomes directly (Removing Voronoi clustering to avoid mega-deserts)
@@ -478,8 +461,10 @@ void AtmosphereSimulator::assignBiomes(const SimulationParameters& params) {
         }
     }
 
-    // Step 3: Cellular Automata Smoothing (2 iterations)
-    for (int iter = 0; iter < 2; ++iter) {
+    // Step 3: Cellular Automata Smoothing — 1 pass, just to shave lone pixels
+    // (Whittaker output is already spatially coherent; more passes erase
+    // legitimate minority biomes).
+    for (int iter = 0; iter < 1; ++iter) {
         std::vector<BiomeType> next_biomes(cells.size());
         for (size_t i = 0; i < cells.size(); ++i) {
             if (cells[i].elevation <= params.effective_sea_level()) {
