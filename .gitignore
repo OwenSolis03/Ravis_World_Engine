@@ -58,11 +58,19 @@ Thumbs.db
 *.swp
 *~
 *.bak
+*.stackdump
 
-# Agent cache and logs (if you prefer to ignore AI memory/context, uncomment these)
-#.agents/
-#.claude/
-#.gitnexus/
-#AGENTS.md
-#CLAUDE.md
-#Analisis_Claude.md
+# Runtime output
+*.log
+worldgen.log
+
+# AI agent / assistant scaffolding — not part of the project
+.agents/
+.claude/
+.gitnexus/
+.cursor/
+.aider*
+AGENTS.md
+CLAUDE.md
+Analisis_Claude.md
+ravis-world-engine-findings.md
