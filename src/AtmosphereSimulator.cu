@@ -328,15 +328,24 @@ void AtmosphereSimulator::calculateWinds(const SimulationParameters& params) {
 void AtmosphereSimulator::simulateMoisture(int iterations, const SimulationParameters& params) {
     auto& cells = planet.getCells();
 
-    // Keep cell.moisture as computed by calculatePrimaryClimate(): it is the
-    // per-latitude initial water reserve (Hadley-like: wet equator, dry ~30 deg,
-    // temperate mid-latitudes, dry poles). Zeroing it here erased that base and
-    // left inland/flat terrain with no moisture source -> mega-deserts, forests
-    // only on windward slopes. precipitation IS an output accumulator, so it
-    // still gets reset to 0.
-    for (auto& cell : cells) {
-        cell.precipitation = 0.0f;
+    // cell.moisture as computed by calculatePrimaryClimate() is the per-latitude
+    // water reserve (Hadley-like: wet equator, dry ~30 deg, temperate mid-lats,
+    // dry poles). Snapshot it and use it two ways: as the initial condition
+    // (don't zero it) AND as a small per-iteration source term for land cells,
+    // so the equatorial rain belt / 30-deg dry band persist across all
+    // iterations instead of washing downwind after the first pass. Without the
+    // source term, inland/flat terrain dries out -> mega-deserts, forests only
+    // on windward slopes. precipitation IS an output accumulator -> reset to 0.
+    std::vector<float> baseMoisture(cells.size());
+    for (size_t i = 0; i < cells.size(); ++i) {
+        baseMoisture[i] = cells[i].moisture;
+        cells[i].precipitation = 0.0f;
     }
+
+    // Fraction of the latitude reserve re-injected into each land cell per step.
+    // Compounds over `iterations` steps; 0.05 lifts land precipitation enough to
+    // remove mega-deserts without turning the map into rainforest.
+    const float landSourceRate = 0.05f;
 
     for (int iter = 0; iter < iterations; ++iter) {
         std::vector<float> next_moisture(cells.size(), 0.0f);
@@ -347,7 +356,9 @@ void AtmosphereSimulator::simulateMoisture(int iterations, const SimulationParam
             
             float currentMoisture = cell.moisture;
             if (cell.elevation <= params.effective_sea_level()) {
-                currentMoisture += cell.temperature * 0.1f; 
+                currentMoisture += cell.temperature * 0.1f; // ocean evaporation
+            } else {
+                currentMoisture += baseMoisture[i] * landSourceRate; // latitude source
             }
             if (currentMoisture > 1.0f) currentMoisture = 1.0f;
             
