@@ -24,10 +24,13 @@ do { \
 // Uses dot products with irrational vectors to mix all coordinates before sin()
 // ============================================================================
 __device__ float hash_noise3d(float x, float y, float z) {
-    // Mix all three coordinates via dot products with large primes
-    float d1 = x * 127.1f + y * 311.7f + z * 74.7f;
-    float d2 = x * 269.5f + y * 183.3f + z * 246.1f;
-    float d3 = x * 419.2f + y * 371.9f + z * 128.9f;
+    // Mix all three coordinates via dot products with large primes.
+    // The constant offsets break linear homogeneity so that noise(-p) is no
+    // longer tied to noise(p) — kills the antipodal (point-inversion) mirror.
+    // MUST stay identical to both cpu_hash_noise3d copies (tectonics/climate sync).
+    float d1 = x * 127.1f + y * 311.7f + z * 74.7f + 91.7f;
+    float d2 = x * 269.5f + y * 183.3f + z * 246.1f + 53.2f;
+    float d3 = x * 419.2f + y * 371.9f + z * 128.9f + 17.9f;
     
     float h1 = sinf(d1) * 43758.5453f;
     float h2 = sinf(d2) * 22578.1459f;
@@ -79,9 +82,10 @@ __device__ float hash_ridge3d(float x, float y, float z, int octaves) {
 
 // CPU-side equivalents for host code
 static float cpu_hash_noise3d(float x, float y, float z) {
-    float d1 = x * 127.1f + y * 311.7f + z * 74.7f;
-    float d2 = x * 269.5f + y * 183.3f + z * 246.1f;
-    float d3 = x * 419.2f + y * 371.9f + z * 128.9f;
+    // Constant offsets: see hash_noise3d (device). Must match it byte-for-byte.
+    float d1 = x * 127.1f + y * 311.7f + z * 74.7f + 91.7f;
+    float d2 = x * 269.5f + y * 183.3f + z * 246.1f + 53.2f;
+    float d3 = x * 419.2f + y * 371.9f + z * 128.9f + 17.9f;
     
     float h1 = std::sin(d1) * 43758.5453f;
     float h2 = std::sin(d2) * 22578.1459f;
@@ -343,14 +347,17 @@ __global__ void tectonic_apply_stress_kernel(
     bool oceanic = is_oceanic[i];
     
     if (fabsf(s) > 0.001f) {
-        // Smoothstep falloff mapping
-        float mag = fabsf(s);
-        float falloff = mag * mag * (3.0f - 2.0f * mag); // Smooth curve
+        // Smoothstep falloff mapping. mag MUST be clamped to [0,1] first: stress
+        // routinely reaches 3-5 at plate boundaries, and for mag > 1.5 the cubic
+        // (3 - 2*mag) turns negative and unbounded -> +/- hundreds of km of uplift
+        // that then feed NaNs/inf into the erosion pass.
+        float mag = fminf(fabsf(s), 1.0f);
+        float falloff = mag * mag * (3.0f - 2.0f * mag); // Smooth curve, now in [0,1]
         
         float delta = 0.0f;
         if (s > 0.0f) { // Convergence (Mountains / Subduction)
             if (oceanic) delta = -falloff * 8000.0f * orogenesis_factor; // Oceanic Trench (Subduction)
-            else delta = falloff * 20000.0f * orogenesis_factor; // Continental Mountains (Himalayas/Andes)
+            else delta = falloff * 8000.0f * orogenesis_factor; // Continental Mountains (Himalayas/Andes)
         } else { // Divergence (Trenches / Ridges)
             if (oceanic) delta = -falloff * 4000.0f; // Mid-Ocean Ridges
             else delta = -falloff * 2000.0f; // Rift valleys
@@ -565,7 +572,7 @@ __global__ void tectonic_fbm_kernel(
     
     if (!is_oceanic[i]) {
         // Continental terrain
-        current_elev += low_noise * 800.0f; // Base continent shape (plateaus)
+        current_elev += low_noise * 500.0f; // Base continent shape (plateaus)
         
         // Add mountains ONLY where stress is high
         current_elev += ridge_hills * 1500.0f * stress_multiplier;
@@ -799,7 +806,7 @@ void TectonicSimulator::generatePlates(int numPlates, const SimulationParameters
             // Flatten plains by applying a power curve. Low values stay low, high values spike up.
             ridge = std::pow(ridge, 2.5f);
             
-            cell.elevation = 100.0f + ridge * 3500.0f + distContVar(rng); 
+            cell.elevation = 50.0f + ridge * 2500.0f + distContVar(rng);
             cell.bedrock = RockType::GRANITE;
             cell.crustal_thickness = 35.0f + (cell.elevation - 100.0f) / 100.0f; // Isostatic equilibrium
             cell.crustal_age = 2500.0f;     
@@ -1171,7 +1178,9 @@ void TectonicSimulator::simulate(int iterations, const SimulationParameters& par
     CHECK_CUDA(cudaMemcpy(h_vel_z.data(), d_vel_z, num_cells * sizeof(float), cudaMemcpyDeviceToHost));
 
     for (int i = 0; i < num_cells; ++i) {
-        cells[i].elevation = h_elev[i];
+        float e = h_elev[i];
+        if (!std::isfinite(e)) e = -3500.0f; // NaN/inf guard: fall back to ocean floor
+        cells[i].elevation = e;
         cells[i].crustal_thickness = h_crustal_thickness[i];
         cells[i].plate_id = h_plate_id[i];
         cells[i].is_oceanic = (h_is_oceanic[i] == 1);

@@ -14,9 +14,12 @@ namespace Ravis {
 
 // CPU-side noise for climate distortion
 static float cpu_hash_noise3d(float x, float y, float z) {
-    float d1 = x * 127.1f + y * 311.7f + z * 74.7f;
-    float d2 = x * 269.5f + y * 183.3f + z * 246.1f;
-    float d3 = x * 419.2f + y * 371.9f + z * 128.9f;
+    // Constant offsets break linear homogeneity so noise(-p) is not tied to
+    // noise(p) (antipodal mirror). MUST match hash_noise3d / cpu_hash_noise3d
+    // in TectonicSimulator.cu byte-for-byte so tectonics and climate agree.
+    float d1 = x * 127.1f + y * 311.7f + z * 74.7f + 91.7f;
+    float d2 = x * 269.5f + y * 183.3f + z * 246.1f + 53.2f;
+    float d3 = x * 419.2f + y * 371.9f + z * 128.9f + 17.9f;
     
     float h1 = std::sin(d1) * 43758.5453f;
     float h2 = std::sin(d2) * 22578.1459f;
@@ -324,9 +327,14 @@ void AtmosphereSimulator::calculateWinds(const SimulationParameters& params) {
 
 void AtmosphereSimulator::simulateMoisture(int iterations, const SimulationParameters& params) {
     auto& cells = planet.getCells();
-    
+
+    // Keep cell.moisture as computed by calculatePrimaryClimate(): it is the
+    // per-latitude initial water reserve (Hadley-like: wet equator, dry ~30 deg,
+    // temperate mid-latitudes, dry poles). Zeroing it here erased that base and
+    // left inland/flat terrain with no moisture source -> mega-deserts, forests
+    // only on windward slopes. precipitation IS an output accumulator, so it
+    // still gets reset to 0.
     for (auto& cell : cells) {
-        cell.moisture = 0.0f;
         cell.precipitation = 0.0f;
     }
 

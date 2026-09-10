@@ -9,11 +9,19 @@
 #include "../include/SimulationParameters.h"
 #include "../include/TectonicSimulator.h"
 
+#include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
+#include <ctime>
+#include <fstream>
+#include <iomanip>
 #include <iostream>
+#include <map>
 #include <mutex>
 #include <random>
+#include <sstream>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -84,6 +92,208 @@ void scroll_callback(GLFWwindow* window, double xoffset, double yoffset) {
     if (camera_distance > 10.0f) camera_distance = 10.0f;
 }
 
+static const char *biomeName(BiomeType b) {
+  switch (b) {
+  case BiomeType::OCEAN: return "Ocean";
+  case BiomeType::ICE: return "Ice";
+  case BiomeType::TUNDRA: return "Tundra";
+  case BiomeType::BOREAL_FOREST: return "BorealForest";
+  case BiomeType::TEMPERATE_FOREST: return "TemperateForest";
+  case BiomeType::GRASSLAND: return "Grassland";
+  case BiomeType::STEPPE: return "Steppe";
+  case BiomeType::RAINFOREST: return "Rainforest";
+  case BiomeType::TEMPERATE_RAINFOREST: return "TemperateRainforest";
+  case BiomeType::TROPICAL_DRY_FOREST: return "TropicalDryForest";
+  case BiomeType::MEDITERRANEAN: return "Mediterranean";
+  case BiomeType::DESERT: return "Desert";
+  case BiomeType::SAVANNA: return "Savanna";
+  case BiomeType::THORN_SCRUB: return "ThornScrub";
+  }
+  return "?";
+}
+
+// Dump the parameters a world was generated with + summary diagnostics to
+// stdout and append them to worldgen.log (in the working directory). The
+// diagnostics exist to tune terrain/climate — e.g. mean continental elevation
+// is the number to watch when continents come out too tall.
+static void logWorldStats(const GoldbergPolyhedron &planet,
+                          const SimulationParameters &params) {
+  const auto &cells = planet.getCells();
+  if (cells.empty())
+    return;
+
+  const double sea = params.effective_sea_level();
+  const size_t n = cells.size();
+
+  size_t land = 0, ocean = 0, landAbove1k = 0, landAbove3k = 0;
+  double landElevSum = 0.0, oceanDepthSum = 0.0;
+  float landMax = -1e30f, oceanMin = 1e30f;
+  std::vector<float> landElev;
+  landElev.reserve(n);
+
+  size_t crustOceanic = 0, crustContinental = 0;
+  double crustOceanicElevSum = 0.0, crustContinentalElevSum = 0.0;
+
+  double tSum = 0.0, pSumLand = 0.0, mSumLand = 0.0;
+  float tMin = 1e30f, tMax = -1e30f;
+  size_t lakeCells = 0, riverCells = 0;
+  std::map<std::string, size_t> biomeCount;
+  std::array<size_t, 5> rockCount{};
+
+  for (const auto &c : cells) {
+    tSum += c.temperature;
+    tMin = std::min(tMin, c.temperature);
+    tMax = std::max(tMax, c.temperature);
+
+    if (c.is_oceanic) {
+      crustOceanic++;
+      crustOceanicElevSum += c.elevation;
+    } else {
+      crustContinental++;
+      crustContinentalElevSum += c.elevation;
+    }
+    if (c.is_lake)
+      lakeCells++;
+    if (c.river_flow > 0.001f)
+      riverCells++;
+
+    int ri = static_cast<int>(c.bedrock);
+    if (ri >= 0 && ri < 5)
+      rockCount[ri]++;
+
+    if (c.elevation > sea) {
+      land++;
+      float e = static_cast<float>(c.elevation - sea);
+      landElevSum += e;
+      landElev.push_back(e);
+      if (e > landMax)
+        landMax = e;
+      if (e > 1000.0f)
+        landAbove1k++;
+      if (e > 3000.0f)
+        landAbove3k++;
+      pSumLand += c.precipitation;
+      mSumLand += c.moisture;
+      biomeCount[biomeName(c.biome)]++;
+    } else {
+      ocean++;
+      oceanDepthSum += (c.elevation - sea);
+      if (c.elevation < oceanMin)
+        oceanMin = c.elevation;
+    }
+  }
+
+  std::sort(landElev.begin(), landElev.end());
+  auto q = [&](double f) -> float {
+    if (landElev.empty())
+      return 0.0f;
+    return landElev[static_cast<size_t>(f * (landElev.size() - 1))];
+  };
+  auto pctN = [&](size_t x) { return n ? 100.0 * x / n : 0.0; };
+  auto pctL = [&](size_t x) { return land ? 100.0 * x / land : 0.0; };
+
+  std::ostringstream o;
+  std::time_t tt = std::time(nullptr);
+  std::tm tmv{};
+#ifdef _WIN32
+  localtime_s(&tmv, &tt);
+#else
+  localtime_r(&tt, &tmv);
+#endif
+
+  o << std::fixed << std::setprecision(1);
+  o << "================================================================\n";
+  o << "[" << std::put_time(&tmv, "%Y-%m-%d %H:%M:%S")
+    << "]  seed=" << params.seed << "\n";
+  o << "-- Parameters --\n";
+  o << "  subdivision_level       " << params.subdivision_level << "\n";
+  o << "  num_plates              " << params.num_plates << "\n";
+  o << "  crust_fraction          " << params.crust_fraction << "\n";
+  o << "  planet_age_Myr          " << params.planet_age_Myr << "\n";
+  o << "  avg_plate_speed_cm_yr   " << params.avg_plate_speed_cm_yr << "\n";
+  o << "  thermal_subsidence_rate " << params.thermal_subsidence_rate << "\n";
+  o << "  orogenesis_factor       " << params.orogenesis_factor << "\n";
+  o << "  primary_clustering      " << params.primary_clustering << "\n";
+  o << "  secondary_clustering    " << params.secondary_clustering << "\n";
+  o << "  crust_warping           " << params.crust_warping << "\n";
+  o << "  use_bisector_distance   "
+    << (params.use_bisector_distance ? "true" : "false") << "\n";
+  o << "  superswell_freq         " << params.superswell_freq << "\n";
+  o << "  shallow_plume_freq      " << params.shallow_plume_freq << "\n";
+  o << "  deep_plume_freq         " << params.deep_plume_freq << "\n";
+  o << "  old_mountain_freq       " << params.old_mountain_freq << "\n";
+  o << "  old_hill_freq           " << params.old_hill_freq << "\n";
+  o << "  small_uplift_freq       " << params.small_uplift_freq << "\n";
+  o << "  upland_freq             " << params.upland_freq << "\n";
+  o << "  sea_level               " << params.sea_level << "\n";
+  o << "  temp_offset             " << params.temp_offset << "\n";
+  o << "  swe_iterations          " << params.swe_iterations << "\n";
+  o << "  moisture_iterations     " << params.moisture_iterations << "\n";
+  o << "  num_drops               " << params.num_drops << "\n";
+  o << "  erosion_rate            " << params.erosion_rate << "\n";
+  o << "  lgm_temp_anomaly        " << params.lgm_temp_anomaly << "\n";
+  o << "  post_lgm_sea_rise       " << params.post_lgm_sea_rise << "\n";
+  o << "  effective_sea_level     " << sea << " m\n";
+
+  o << "-- Geography (" << n << " cells) --\n";
+  o << "  land / ocean            " << land << " (" << pctN(land) << "%)  /  "
+    << ocean << " (" << pctN(ocean) << "%)\n";
+  o << "  continental elev  mean  " << (land ? landElevSum / land : 0.0)
+    << " m   median " << q(0.5) << "   p90 " << q(0.9) << "   max " << landMax
+    << " m\n";
+  o << "    land > 1000 m         " << landAbove1k << " (" << pctL(landAbove1k)
+    << "% of land)\n";
+  o << "    land > 3000 m         " << landAbove3k << " (" << pctL(landAbove3k)
+    << "% of land)\n";
+  o << "  oceanic depth     mean  " << (ocean ? oceanDepthSum / ocean : 0.0)
+    << " m   deepest " << (oceanMin - sea) << " m\n";
+  o << "  crust flag oceanic      " << crustOceanic << "   mean elev "
+    << (crustOceanic ? crustOceanicElevSum / crustOceanic : 0.0) << " m\n";
+  o << "  crust flag continental  " << crustContinental << "   mean elev "
+    << (crustContinental ? crustContinentalElevSum / crustContinental : 0.0)
+    << " m\n";
+
+  o << "-- Climate --\n";
+  o << std::setprecision(3);
+  o << "  temperature norm  mean  " << (n ? tSum / n : 0.0) << "   [" << tMin
+    << " .. " << tMax << "]\n";
+  o << std::setprecision(1);
+  o << "    approx deg C   mean   " << (n ? (tSum / n) * 55.0 - 15.0 : 0.0)
+    << "   [" << (tMin * 55.0 - 15.0) << " .. " << (tMax * 55.0 - 15.0)
+    << "]\n";
+  o << std::setprecision(3);
+  o << "  precipitation norm mean " << (land ? pSumLand / land : 0.0)
+    << "  (land)\n";
+  o << std::setprecision(0);
+  o << "    approx mm/yr   mean   " << (land ? (pSumLand / land) * 8000.0 : 0.0)
+    << "\n";
+  o << std::setprecision(3);
+  o << "  moisture norm      mean " << (land ? mSumLand / land : 0.0)
+    << "  (land)\n";
+  o << std::setprecision(1);
+  o << "  lake cells " << lakeCells << "   river cells " << riverCells << "\n";
+
+  o << "-- Biomes (land) --\n";
+  for (const auto &kv : biomeCount)
+    o << "  " << std::left << std::setw(22) << kv.first << std::right
+      << kv.second << " (" << pctL(kv.second) << "%)\n";
+
+  static const char *rockNames[5] = {"Basalt", "Granite", "Sandstone",
+                                     "ShaleLimestone", "Metamorphic"};
+  o << "-- Bedrock (all cells) --\n";
+  for (int i = 0; i < 5; ++i)
+    o << "  " << std::left << std::setw(22) << rockNames[i] << std::right
+      << rockCount[i] << " (" << pctN(rockCount[i]) << "%)\n";
+  o << "\n";
+
+  std::cout << o.str() << std::flush;
+  std::ofstream f("worldgen.log", std::ios::app);
+  if (f)
+    f << o.str();
+  else
+    std::cerr << "WARN: could not open worldgen.log for writing\n";
+}
+
 void runSimulation(SimulationParameters params) {
   // If seed is 0, generate a random seed
   if (params.seed == 0) {
@@ -123,6 +333,9 @@ void runSimulation(SimulationParameters params) {
 
   PedologySimulator pedology(*new_planet);
   pedology.generateSoils(params);
+
+  // Record parameters + diagnostics for this world (stdout + worldgen.log)
+  logWorldStats(*new_planet, params);
 
   // Build pixel->cell lookup ONCE, then render all maps in O(pixels) each
   auto cellMap =
