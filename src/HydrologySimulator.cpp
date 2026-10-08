@@ -44,65 +44,109 @@ void HydrologySimulator::buildDrainageNetwork(const SimulationParameters& params
         cells[i].downstream_id = lowestId;
     }
 
-    // Step 1.5: Carve canyons from pits to the sea (BFS)
+    // Step 1.5: Resolve depressions. For every pit, BFS out to an escape (ocean
+    // or lower ground), tracking the highest cell crossed — the sill. A pit
+    // whose basin is small and shallow becomes a lake (flag only, no elevation
+    // change); anything larger/deeper is carved down to the outlet so it drains.
+    // Hard caps keep a bad noise field from flooding the whole continent.
+    const int    LAKE_MAX_BASIN   = 250;                  // cells per lake
+    const float  LAKE_MAX_SILL    = 220.0f;               // m the sill may sit above the pit
+    const float  CLIMB_BUDGET     = 400.0f;               // m of climb allowed to find an escape
+    const size_t LAKE_MAX_TOTAL   = cells.size() / 120;   // ~0.8% of all cells
+    size_t lakeCellsUsed = 0;
+
     for (size_t i = 0; i < cells.size(); ++i) {
         if (cells[i].elevation <= params.sea_level) continue;
-        
-        // If it's a pit, run BFS
-        if (cells[i].downstream_id == i) {
-            std::queue<size_t> q;
-            std::vector<size_t> parent(cells.size(), static_cast<size_t>(-1));
-            std::vector<bool> visited(cells.size(), false);
-            
-            q.push(i);
-            visited[i] = true;
-            
-            size_t targetId = static_cast<size_t>(-1);
-            
-            while (!q.empty()) {
-                size_t curr = q.front();
-                q.pop();
-                
-                if (cells[curr].elevation < cells[i].elevation || cells[curr].elevation <= params.sea_level) {
-                    targetId = curr;
-                    break;
+        if (cells[i].downstream_id != i) continue; // not a pit
+        if (cells[i].is_lake) continue;            // already flooded from another pit
+
+        const float pitElev = cells[i].elevation;
+
+        // --- find an escape and the sill along the way ---
+        std::queue<size_t> q;
+        std::vector<size_t> parent(cells.size(), static_cast<size_t>(-1));
+        std::vector<char> vis(cells.size(), 0);
+        q.push(i);
+        vis[i] = 1;
+        size_t outlet = static_cast<size_t>(-1);
+
+        while (!q.empty()) {
+            size_t cur = q.front();
+            q.pop();
+            if (cur != i && (cells[cur].elevation < pitElev ||
+                             cells[cur].elevation <= params.sea_level)) {
+                outlet = cur;
+                break;
+            }
+            for (size_t nid : cells[cur].neighbors) {
+                if (!vis[nid] && cells[nid].elevation < pitElev + CLIMB_BUDGET) {
+                    vis[nid] = 1;
+                    parent[nid] = cur;
+                    q.push(nid);
                 }
-                
-                // Allow climbing slightly (to escape the basin), but not climbing Everest
-                for (size_t nid : cells[curr].neighbors) {
-                    if (!visited[nid] && cells[nid].elevation < cells[i].elevation + 1500.0f) {
-                        visited[nid] = true;
-                        parent[nid] = curr;
-                        q.push(nid);
+            }
+        }
+        if (outlet == static_cast<size_t>(-1)) continue; // fully closed — leave as a pit
+
+        std::vector<size_t> path; // outlet -> ... -> i
+        for (size_t n = outlet; n != static_cast<size_t>(-1); n = parent[n]) path.push_back(n);
+
+        float sill = pitElev;
+        for (size_t k = 1; k + 1 < path.size(); ++k)
+            sill = std::max(sill, cells[path[k]].elevation);
+
+        // --- gather the basin (land cells strictly below the sill), capped ---
+        std::vector<size_t> basin;
+        bool basinTooBig = false;
+        bool basinTouchesOcean = false;
+        {
+            std::queue<size_t> bq;
+            std::vector<char> bvis(cells.size(), 0);
+            bq.push(i);
+            bvis[i] = 1;
+            while (!bq.empty()) {
+                size_t cur = bq.front();
+                bq.pop();
+                basin.push_back(cur);
+                if (basin.size() > static_cast<size_t>(LAKE_MAX_BASIN)) { basinTooBig = true; break; }
+                for (size_t nid : cells[cur].neighbors) {
+                    if (cells[nid].elevation <= params.sea_level) { basinTouchesOcean = true; continue; }
+                    if (!bvis[nid] && !cells[nid].is_lake && cells[nid].elevation < sill) {
+                        bvis[nid] = 1;
+                        bq.push(nid);
                     }
                 }
             }
-            
-            // If we found a valid lower ground or ocean
-            if (targetId != static_cast<size_t>(-1)) {
-                size_t pathNode = targetId;
-                std::vector<size_t> path;
-                while (pathNode != i) {
-                    path.push_back(pathNode);
-                    pathNode = parent[pathNode];
-                }
-                path.push_back(i);
-                
-                float startElev = cells[i].elevation;
-                float endElev = cells[targetId].elevation;
-                if (endElev >= startElev) endElev = startElev - 1.0f; 
-                
-                float elevStep = (startElev - endElev) / static_cast<float>(path.size());
-                
-                for (size_t p = 0; p < path.size() - 1; ++p) {
-                    size_t curr = path[path.size() - 1 - p];
-                    size_t next = path[path.size() - 2 - p];
-                    
-                    cells[curr].downstream_id = next;
-                    // Carve the canyon so water physically flows down
-                    cells[curr].elevation = std::min(cells[curr].elevation, startElev - p * elevStep);
-                }
-                cells[targetId].elevation = std::min(cells[targetId].elevation, startElev - (path.size() - 1) * elevStep);
+        }
+
+        // Only a genuinely land-locked basin becomes a lake: it must spill over
+        // land (not straight into the sea) and no basin cell may border ocean.
+        bool makeLake = !basinTooBig && !basinTouchesOcean &&
+                        cells[outlet].elevation > params.sea_level &&
+                        (sill - pitElev) <= LAKE_MAX_SILL &&
+                        (lakeCellsUsed + basin.size()) <= LAKE_MAX_TOTAL;
+
+        if (makeLake) {
+            for (size_t c : basin) {
+                cells[c].is_lake = true;
+                cells[c].downstream_id = i; // pool toward the pit
+            }
+            lakeCellsUsed += basin.size();
+            // Overflow: route pit -> path -> outlet.
+            for (size_t k = 0; k + 1 < path.size(); ++k)
+                cells[path[k + 1]].downstream_id = path[k];
+            cells[i].downstream_id = (path.size() >= 2) ? path[path.size() - 2] : outlet;
+        } else {
+            // Carve a monotonic channel from the pit down to the outlet.
+            float startElev = pitElev;
+            float endElev = std::min(cells[outlet].elevation, startElev - 1.0f);
+            float step = (startElev - endElev) / static_cast<float>(path.size());
+            for (size_t k = 0; k + 1 < path.size(); ++k) {
+                size_t cur = path[path.size() - 1 - k]; // from i outward
+                size_t nxt = path[path.size() - 2 - k];
+                cells[cur].downstream_id = nxt;
+                cells[cur].elevation =
+                    std::min(cells[cur].elevation, startElev - k * step);
             }
         }
     }
@@ -224,9 +268,13 @@ void HydrologySimulator::applyRiparianEffect(const SimulationParameters& params)
         }
     }
     
-    // Apply the boost
+    // Apply the boost. Riparian zones get more plant-available water (moisture)
+    // and, at a smaller rate, count as wetter for biome classification
+    // (precipitation) so gallery forests / green lake shores actually form when
+    // assignBiomes runs again after hydrology.
     for (size_t i = 0; i < cells.size(); ++i) {
         cells[i].moisture = std::min(1.0f, cells[i].moisture + moistureBoost[i]);
+        cells[i].precipitation = std::min(1.0f, cells[i].precipitation + moistureBoost[i] * 0.6f);
     }
 }
 

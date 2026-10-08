@@ -1,5 +1,6 @@
 #include "../include/ErosionSimulator.h"
 #include "../include/MathUtils.h"
+#include <cmath>
 #include <random>
 #include <iostream>
 #include <vector>
@@ -76,7 +77,10 @@ __global__ void erosion_drop_kernel(
             break;
         }
         
-        float elevDiff = elevation[currentId] - elevation[lowestNeighbor];
+        // Clamp to >= 0: 200k drops mutate `elevation` concurrently via atomicAdd,
+        // so a neighbour picked as "lowest" can be raised above us before we read
+        // it. A negative elevDiff here later makes sqrtf(v^2 + elevDiff*9.8) NaN.
+        float elevDiff = fmaxf(0.0f, elevation[currentId] - elevation[lowestNeighbor]);
         float dx = pos_x[currentId] - pos_x[lowestNeighbor];
         float dy = pos_y[currentId] - pos_y[lowestNeighbor];
         float dz = pos_z[currentId] - pos_z[lowestNeighbor];
@@ -96,7 +100,7 @@ __global__ void erosion_drop_kernel(
         float current_erosion_rate = base_erosion * erosion_rate;
 
         if (sediment > capacity) {
-            float amount = (sediment - capacity) * deposition_rate;
+            float amount = fminf((sediment - capacity) * deposition_rate, 800.0f);
             sediment -= amount;
             atomicAdd(&elevation[currentId], amount);
             
@@ -106,12 +110,16 @@ __global__ void erosion_drop_kernel(
             }
         } else {
             float amount = fminf((capacity - sediment) * current_erosion_rate, elevDiff);
+            amount = fminf(amount, 800.0f);
             sediment += amount;
             atomicAdd(&elevation[currentId], -amount);
         }
 
         currentId = lowestNeighbor;
-        velocity = sqrtf(velocity * velocity + elevDiff * 9.8f) * (1.0f - friction);
+        // fmaxf(0,...) is belt-and-suspenders (elevDiff is already >= 0); the
+        // fminf cap stops a runaway velocity/capacity feedback loop.
+        velocity = sqrtf(fmaxf(0.0f, velocity * velocity + elevDiff * 9.8f)) * (1.0f - friction);
+        velocity = fminf(velocity, 100.0f);
         water *= (1.0f - evaporation_rate);
 
         if (elevation[currentId] <= sea_level) {
@@ -260,7 +268,9 @@ void ErosionSimulator::simulateErosion(int numDrops, const SimulationParameters&
     CHECK_CUDA(cudaMemcpy(h_bedrock.data(), d_bedrock, num_cells * sizeof(RockType), cudaMemcpyDeviceToHost));
 
     for (int i = 0; i < num_cells; ++i) {
-        cells[i].elevation = h_elevation[i];
+        float e = h_elevation[i];
+        if (!std::isfinite(e)) e = params.sea_level - 200.0f; // NaN/inf guard
+        cells[i].elevation = e;
         cells[i].bedrock = h_bedrock[i];
     }
 
