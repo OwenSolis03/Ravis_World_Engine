@@ -8,7 +8,13 @@ set(CMAKE_CXX_STANDARD_REQUIRED True)
 enable_language(CUDA)
 set(CMAKE_CUDA_STANDARD 20)
 set(CMAKE_CUDA_STANDARD_REQUIRED True)
-set(CMAKE_CUDA_ARCHITECTURES 89)
+# Ada (sm_89) + Blackwell (sm_120, e.g. RTX 5060) when the toolkit supports it;
+# older toolkits ship only sm_89 and newer GPUs JIT the embedded PTX.
+if(CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 12.8)
+    set(CMAKE_CUDA_ARCHITECTURES 89 120)
+else()
+    set(CMAKE_CUDA_ARCHITECTURES 89)
+endif()
 
 # Add include directories
 include_directories(include)
@@ -26,6 +32,7 @@ set(SOURCES
     src/ErosionSimulator.cu
     src/PedologySimulator.cpp
     src/HydrologySimulator.cpp
+    src/TerrainEditor.cpp
 )
 
 # Find OpenMP for erosion parallelism

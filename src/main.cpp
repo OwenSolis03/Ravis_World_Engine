@@ -8,6 +8,7 @@
 #include "../include/PedologySimulator.h"
 #include "../include/SimulationParameters.h"
 #include "../include/TectonicSimulator.h"
+#include "../include/TerrainEditor.h"
 
 #include <algorithm>
 #include <array>
@@ -54,6 +55,22 @@ int active_map_index = 0; // 0:Biome, 1:Height, 2:Lithology, 3:Pedology, 4:Hydro
 
 std::shared_ptr<GoldbergPolyhedron> active_planet = nullptr;
 
+// UI-editable parameters (global so the input callbacks can trigger recomputes)
+SimulationParameters params;
+std::atomic<int> last_world_seed(0); // seed actually used by the last generation
+
+// Terrain editing state
+TerrainEditor terrain_editor;
+bool edit_mode = false;
+int brush_mode = 0;              // 0 = Raise, 1 = Lower
+float brush_radius_km = 400.0f;  // geodesic radius, Earth-like radius assumed
+float brush_strength_m = 800.0f; // peak delta per dab, meters
+bool is_painting = false;
+int last_painted_cell = -1;
+bool stroke_made_changes = false;
+GLFWwindow* g_window = nullptr;
+const float kPlanetRadiusKm = 6371.0f; // brush km -> radians conversion
+
 // 3D rendering data
 std::vector<float> globe_vertices; // [x,y,z, r,g,b]
 std::vector<unsigned int> globe_indices;
@@ -66,15 +83,177 @@ bool show_3d = true;
 bool update_3d_geometry = false;
 bool update_3d_colors = false;
 
+// Unproject the mouse onto the globe. Inverse of the render transform
+// (view = T(0,0,-dist) * Rx(pitch) * Ry(yaw) * model), intersecting the
+// view-space ray with the unit sphere centered at (0,0,-dist).
+// Returns the model-space point on the unit sphere.
+static bool pickSpherePoint(GLFWwindow* window, double mx, double my, Vector3& out_model) {
+    int ww = 0, wh = 0;
+    glfwGetWindowSize(window, &ww, &wh);
+    if (ww <= 0 || wh <= 0) return false;
+
+    // Mouse -> view-space ray (same 45 deg vertical FOV as the projection)
+    float ndc_x = 2.0f * static_cast<float>(mx) / ww - 1.0f;
+    float ndc_y = 1.0f - 2.0f * static_cast<float>(my) / wh;
+    float aspect = static_cast<float>(ww) / static_cast<float>(wh);
+    float tan_half = tanf(45.0f * 0.5f * 3.1415926535f / 180.0f);
+    Vector3 dir = Math::normalize(Vector3(ndc_x * tan_half * aspect, ndc_y * tan_half, -1.0));
+
+    // |t*dir - c|^2 = 1 with c = (0,0,-dist):  t^2 - 2t(dir.c) + |c|^2 - 1 = 0
+    Vector3 c(0.0, 0.0, -camera_distance);
+    double b = Math::dotProduct(dir, c);
+    double disc = b * b - (Math::dotProduct(c, c) - 1.0);
+    if (disc < 0.0) return false; // ray misses the globe
+    double t = b - std::sqrt(disc); // near intersection
+    if (t < 0.0) return false;
+
+    // Back to model space: q = view point relative to sphere center,
+    // model = Ry(-yaw) * Rx(-pitch) * q
+    Vector3 q(dir.x * t - c.x, dir.y * t - c.y, dir.z * t - c.z);
+    double cp = std::cos(camera_pitch), sp = std::sin(camera_pitch);
+    double cy = std::cos(camera_yaw), sy = std::sin(camera_yaw);
+    Vector3 r1(q.x, q.y * cp + q.z * sp, -q.y * sp + q.z * cp); // Rx(-pitch)
+    Vector3 r2(r1.x * cy - r1.z * sy, r1.y, r1.x * sy + r1.z * cy); // Ry(-yaw)
+    out_model = Math::normalize(r2);
+    return true;
+}
+
+// Rebuild all 2D map textures from the planet and publish it as the active
+// world (shared by full generation and by post-edit recomputes).
+static void publishMaps(std::shared_ptr<GoldbergPolyhedron> planet,
+                        const SimulationParameters& p) {
+    float eff_sea = p.effective_sea_level();
+    auto cellMap = MapExporter::buildPixelToCellMap(*planet, tex_width, tex_height);
+    auto b_pixels = MapExporter::getBiomePixels(*planet, tex_width, tex_height, eff_sea, cellMap);
+    auto h_pixels = MapExporter::getHeightPixels(*planet, tex_width, tex_height, eff_sea, cellMap);
+    auto l_pixels = MapExporter::getLithologyPixels(*planet, tex_width, tex_height, eff_sea, cellMap);
+    auto p_pixels = MapExporter::getPedologyPixels(*planet, tex_width, tex_height, eff_sea, cellMap);
+    auto y_pixels = MapExporter::getHydrologyPixels(*planet, tex_width, tex_height, eff_sea, cellMap);
+    auto t_pixels = MapExporter::getTemperaturePixels(*planet, tex_width, tex_height, eff_sea, cellMap);
+    auto m_pixels = MapExporter::getMoisturePixels(*planet, tex_width, tex_height, eff_sea, cellMap);
+
+    std::lock_guard<std::mutex> lock(pixel_mutex);
+    biome_pixels = std::move(b_pixels);
+    height_pixels = std::move(h_pixels);
+    lithology_pixels = std::move(l_pixels);
+    pedology_pixels = std::move(p_pixels);
+    hydrology_pixels = std::move(y_pixels);
+    temperature_pixels = std::move(t_pixels);
+    moisture_pixels = std::move(m_pixels);
+    active_planet = planet;
+    new_map_ready = true;
+    update_3d_geometry = true;
+    update_3d_colors = true;
+}
+
+// Re-derive climate -> hydrology -> biomes -> soils from the (edited)
+// elevation field, without regenerating the mesh or re-running tectonics and
+// erosion. Erosion is intentionally excluded so it cannot eat user edits;
+// this is the same pipeline order runSimulation uses after erosion.
+void recomputeDerivedFields(SimulationParameters p) {
+    std::shared_ptr<GoldbergPolyhedron> planet;
+    {
+        std::lock_guard<std::mutex> lock(pixel_mutex);
+        planet = active_planet;
+    }
+    if (!planet) {
+        is_simulating = false;
+        return;
+    }
+
+    p.seed = last_world_seed.load(); // keep noise fields identical to generation
+
+    std::cout << "Recomputing climate after terrain edit..." << std::endl;
+    AtmosphereSimulator atmosphere(*planet);
+    atmosphere.calculatePrimaryClimate(p);
+
+    OceanSimulator ocean(*planet);
+    ocean.simulateCurrents(p);
+
+    atmosphere.calculateFullClimate(p.moisture_iterations, p);
+
+    HydrologySimulator hydrology(*planet);
+    hydrology.simulate(p);
+
+    atmosphere.assignBiomes(p);
+
+    PedologySimulator pedology(*planet);
+    pedology.classifyBedrock(p);
+    pedology.generateSoils(p);
+
+    publishMaps(planet, p);
+    std::cout << "Recompute complete." << std::endl;
+    is_simulating = false;
+}
+
+static void startRecompute() {
+    if (is_simulating) return;
+    is_simulating = true;
+    if (sim_thread.joinable()) sim_thread.join();
+    sim_thread = std::thread(recomputeDerivedFields, params);
+}
+
+// Apply one brush dab at the cursor. Runs on the main thread; never while a
+// background simulation owns the cells.
+static void paintAtCursor(double mx, double my) {
+    if (is_simulating || !show_3d) return;
+    std::shared_ptr<GoldbergPolyhedron> planet;
+    {
+        std::lock_guard<std::mutex> lock(pixel_mutex);
+        planet = active_planet;
+    }
+    if (!planet || !terrain_editor.hasBase()) return;
+
+    Vector3 p;
+    if (!pickSpherePoint(g_window, mx, my, p)) return;
+    int cell = TerrainEditor::pickCell(*planet, p);
+    if (cell < 0 || cell == last_painted_cell) return; // one dab per cell crossed
+    last_painted_cell = cell;
+
+    float radius_rad = brush_radius_km / kPlanetRadiusKm;
+    EditOpType type = (brush_mode == 0) ? EditOpType::RAISE : EditOpType::LOWER;
+    if (terrain_editor.applyDab(*planet, type, p, radius_rad, brush_strength_m)) {
+        stroke_made_changes = true;
+        update_3d_colors = true; // show the raw terrain change immediately
+    }
+}
+
 void mouse_button_callback(GLFWwindow* window, int button, int action, int mods) {
     if (ImGui::GetIO().WantCaptureMouse) return;
     if (button == GLFW_MOUSE_BUTTON_LEFT) {
+        if (action == GLFW_PRESS) {
+            if (edit_mode && show_3d && !is_simulating && active_planet) {
+                is_painting = true;
+                stroke_made_changes = false;
+                last_painted_cell = -1;
+                terrain_editor.beginStroke();
+                paintAtCursor(last_mouse_x, last_mouse_y);
+            } else {
+                is_dragging = true;
+            }
+        } else if (action == GLFW_RELEASE) {
+            is_dragging = false;
+            if (is_painting) {
+                is_painting = false;
+                // Propagate the edit: winds, rain shadow, rivers, biomes.
+                if (stroke_made_changes) startRecompute();
+            }
+        }
+    }
+    // Right button always rotates, so the camera still works in Edit Mode.
+    if (button == GLFW_MOUSE_BUTTON_RIGHT) {
         if (action == GLFW_PRESS) is_dragging = true;
         else if (action == GLFW_RELEASE) is_dragging = false;
     }
 }
 
 void cursor_position_callback(GLFWwindow* window, double xpos, double ypos) {
+    if (is_painting) {
+        paintAtCursor(xpos, ypos);
+        last_mouse_x = xpos;
+        last_mouse_y = ypos;
+        return;
+    }
     if (is_dragging) {
         camera_yaw += (xpos - last_mouse_x) * 0.01f;
         camera_pitch += (ypos - last_mouse_y) * 0.01f;
@@ -311,8 +490,6 @@ void runSimulation(SimulationParameters params) {
         std::chrono::steady_clock::now().time_since_epoch().count() % 1000000);
   }
 
-  float eff_sea = params.effective_sea_level();
-
   std::cout << "Starting simulation (seed: " << params.seed << ")..."
             << std::endl;
   auto new_planet = std::make_shared<GoldbergPolyhedron>();
@@ -348,38 +525,15 @@ void runSimulation(SimulationParameters params) {
   // Record parameters + diagnostics for this world (stdout + worldgen.log)
   logWorldStats(*new_planet, params);
 
-  // Build pixel->cell lookup ONCE, then render all maps in O(pixels) each
-  auto cellMap =
-      MapExporter::buildPixelToCellMap(*new_planet, tex_width, tex_height);
-  auto b_pixels = MapExporter::getBiomePixels(*new_planet, tex_width, tex_height,
-                                              eff_sea, cellMap);
-  auto h_pixels = MapExporter::getHeightPixels(*new_planet, tex_width, tex_height,
-                                               eff_sea, cellMap);
-  auto l_pixels = MapExporter::getLithologyPixels(*new_planet, tex_width, tex_height,
-                                                  eff_sea, cellMap);
-  auto p_pixels = MapExporter::getPedologyPixels(*new_planet, tex_width, tex_height,
-                                                 eff_sea, cellMap);
-  auto y_pixels = MapExporter::getHydrologyPixels(*new_planet, tex_width, tex_height,
-                                                 eff_sea, cellMap);
-  auto t_pixels = MapExporter::getTemperaturePixels(*new_planet, tex_width, tex_height,
-                                                 eff_sea, cellMap);
-  auto m_pixels = MapExporter::getMoisturePixels(*new_planet, tex_width, tex_height,
-                                                 eff_sea, cellMap);
-
+  // The finished terrain becomes the immutable base layer for brush edits.
+  // Locked because the UI thread reads the editor's stroke counters.
+  last_world_seed = params.seed;
   {
     std::lock_guard<std::mutex> lock(pixel_mutex);
-    biome_pixels = std::move(b_pixels);
-    height_pixels = std::move(h_pixels);
-    lithology_pixels = std::move(l_pixels);
-    pedology_pixels = std::move(p_pixels);
-    hydrology_pixels = std::move(y_pixels);
-    temperature_pixels = std::move(t_pixels);
-    moisture_pixels = std::move(m_pixels);
-    active_planet = new_planet;
-    new_map_ready = true;
-    update_3d_geometry = true;
-    update_3d_colors = true;
+    terrain_editor.captureBase(*new_planet);
   }
+
+  publishMaps(new_planet, params);
 
   std::cout << "Simulation complete! (seed: " << params.seed << ")"
             << std::endl;
@@ -399,6 +553,7 @@ int main() {
   if (!window)
     return -1;
 
+  g_window = window;
   glfwMakeContextCurrent(window);
   glfwSwapInterval(1); // VSync
 
@@ -416,7 +571,6 @@ int main() {
   ImGui_ImplGlfw_InitForOpenGL(window, true);
   ImGui_ImplOpenGL3_Init(glsl_version);
 
-  SimulationParameters params;
   GLuint map_texture = 0;
 
   // Create an empty texture initially
@@ -583,6 +737,65 @@ int main() {
     float eff = params.effective_sea_level();
     ImGui::Text("Effective Sea Level: %.1f m", eff);
 
+    ImGui::Spacing();
+
+    // --- Terrain Editing ---
+    ImGui::Text("Terrain Editing");
+    ImGui::Separator();
+
+    ImGui::Checkbox("Edit Mode", &edit_mode);
+    if (ImGui::IsItemHovered())
+      ImGui::SetTooltip("Paint on the 3D globe with Left Click + Drag.\n"
+                        "On release, climate, rivers and biomes are recomputed\n"
+                        "around your edit. Rotate with Right Click + Drag.");
+
+    if (edit_mode) {
+      const char *brush_items[] = {"Raise", "Lower"};
+      ImGui::Combo("Brush", &brush_mode, brush_items, IM_ARRAYSIZE(brush_items));
+
+      ImGui::SliderFloat("Brush Radius (km)", &brush_radius_km, 50.0f, 2000.0f);
+      if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Geodesic brush radius (Earth-sized planet assumed).");
+
+      ImGui::SliderFloat("Brush Strength (m)", &brush_strength_m, 50.0f, 3000.0f);
+      if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Peak elevation change per dab, with cosine falloff.");
+
+      if (!is_simulating) {
+        std::lock_guard<std::mutex> lock(pixel_mutex);
+        ImGui::Text("Strokes: %zu (dabs: %zu)", terrain_editor.strokeCount(),
+                    terrain_editor.opCount());
+      }
+
+      if (!is_simulating && terrain_editor.strokeCount() > 0) {
+        std::shared_ptr<GoldbergPolyhedron> edit_planet;
+        {
+          std::lock_guard<std::mutex> lock(pixel_mutex);
+          edit_planet = active_planet;
+        }
+        if (edit_planet) {
+          if (ImGui::Button("Undo Stroke")) {
+            if (terrain_editor.undoLastStroke(*edit_planet)) {
+              update_3d_colors = true;
+              startRecompute();
+            }
+          }
+          ImGui::SameLine();
+          if (ImGui::Button("Clear All Edits")) {
+            terrain_editor.clearEdits(*edit_planet);
+            update_3d_colors = true;
+            startRecompute();
+          }
+        }
+      }
+      if (!show_3d)
+        ImGui::TextColored(ImVec4(1, 0.6f, 0.3f, 1),
+                           "Enable the 3D globe to paint.");
+      if (!terrain_editor.hasBase())
+        ImGui::TextColored(ImVec4(1, 0.6f, 0.3f, 1),
+                           "Generate a world first.");
+    }
+
     ImGui::Separator();
 
     if (is_simulating) {
@@ -614,7 +827,12 @@ int main() {
     ImGui::Separator();
     ImGui::Checkbox("Show 3D Globe", &show_3d);
     if (show_3d) {
-        ImGui::TextColored(ImVec4(0.5f, 1.0f, 0.5f, 1.0f), "Left Click + Drag to Rotate");
+        if (edit_mode) {
+            ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.4f, 1.0f), "Left Click + Drag to Paint");
+            ImGui::TextColored(ImVec4(0.5f, 1.0f, 0.5f, 1.0f), "Right Click + Drag to Rotate");
+        } else {
+            ImGui::TextColored(ImVec4(0.5f, 1.0f, 0.5f, 1.0f), "Left Click + Drag to Rotate");
+        }
         ImGui::TextColored(ImVec4(0.5f, 1.0f, 0.5f, 1.0f), "Scroll to Zoom");
         if (ImGui::Button("Reset Camera (North Up)")) {
             camera_pitch = -1.570796f;
