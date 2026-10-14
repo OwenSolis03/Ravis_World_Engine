@@ -25,7 +25,6 @@ set(SOURCES
     src/main.cpp
     src/GoldbergPolyhedron.cpp
     src/MapExporter.cpp
-    src/MapExporterCUDA.cu
     src/TectonicSimulator.cu
     src/AtmosphereSimulator.cu
     src/OceanSimulator.cu

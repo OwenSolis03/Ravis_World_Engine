@@ -74,17 +74,38 @@ const float kPlanetRadiusKm = 6371.0f; // brush km -> radians conversion
 // 3D rendering data
 std::vector<float> globe_vertices; // [x,y,z, r,g,b]
 std::vector<unsigned int> globe_indices;
+// Orbit camera: it always looks at the point (camera_lat, camera_lon) of the
+// planet from camera_distance planet radii, with north up on screen.
 float camera_distance = 3.0f;
-float camera_yaw = 0.0f;
-float camera_pitch = 0.0f;
+float camera_lon = 0.0f; // radians, east positive
+float camera_lat = 0.0f; // radians, north positive
 bool is_dragging = false;
 double last_mouse_x, last_mouse_y;
 bool show_3d = true;
 bool update_3d_geometry = false;
 bool update_3d_colors = false;
+const float kCameraFovY = 45.0f * 3.1415926535f / 180.0f;
+const float kCameraMinDistance = 1.15f;
+const float kCameraMaxDistance = 8.0f;
+
+// 2D map editing state
+std::vector<size_t> map_cell_lookup; // pixel -> cell of the current planet
+bool is_painting_2d = false;
+bool map_preview_dirty = false; // elevation changed under the 2D map
+
+// Rotation taking model space (planet axis = +Z) to view space, as three
+// columns: the looked-at point lands on +Z (towards the camera), north on +Y
+// and east on +X.
+static void cameraRotation(Vector3& col_x, Vector3& col_y, Vector3& col_z) {
+    double sl = std::sin(camera_lat), cl = std::cos(camera_lat);
+    double so = std::sin(camera_lon), co = std::cos(camera_lon);
+    col_x = Vector3(-so, -sl * co, cl * co);
+    col_y = Vector3(co, -sl * so, cl * so);
+    col_z = Vector3(0.0, cl, sl);
+}
 
 // Unproject the mouse onto the globe. Inverse of the render transform
-// (view = T(0,0,-dist) * Rx(pitch) * Ry(yaw) * model), intersecting the
+// (view = T(0,0,-dist) * R * model, R from cameraRotation), intersecting the
 // view-space ray with the unit sphere centered at (0,0,-dist).
 // Returns the model-space point on the unit sphere.
 static bool pickSpherePoint(GLFWwindow* window, double mx, double my, Vector3& out_model) {
@@ -96,7 +117,7 @@ static bool pickSpherePoint(GLFWwindow* window, double mx, double my, Vector3& o
     float ndc_x = 2.0f * static_cast<float>(mx) / ww - 1.0f;
     float ndc_y = 1.0f - 2.0f * static_cast<float>(my) / wh;
     float aspect = static_cast<float>(ww) / static_cast<float>(wh);
-    float tan_half = tanf(45.0f * 0.5f * 3.1415926535f / 180.0f);
+    float tan_half = tanf(kCameraFovY * 0.5f);
     Vector3 dir = Math::normalize(Vector3(ndc_x * tan_half * aspect, ndc_y * tan_half, -1.0));
 
     // |t*dir - c|^2 = 1 with c = (0,0,-dist):  t^2 - 2t(dir.c) + |c|^2 - 1 = 0
@@ -108,14 +129,30 @@ static bool pickSpherePoint(GLFWwindow* window, double mx, double my, Vector3& o
     if (t < 0.0) return false;
 
     // Back to model space: q = view point relative to sphere center,
-    // model = Ry(-yaw) * Rx(-pitch) * q
+    // model = R^T * q
     Vector3 q(dir.x * t - c.x, dir.y * t - c.y, dir.z * t - c.z);
-    double cp = std::cos(camera_pitch), sp = std::sin(camera_pitch);
-    double cy = std::cos(camera_yaw), sy = std::sin(camera_yaw);
-    Vector3 r1(q.x, q.y * cp + q.z * sp, -q.y * sp + q.z * cp); // Rx(-pitch)
-    Vector3 r2(r1.x * cy - r1.z * sy, r1.y, r1.x * sy + r1.z * cy); // Ry(-yaw)
-    out_model = Math::normalize(r2);
+    Vector3 col_x, col_y, col_z;
+    cameraRotation(col_x, col_y, col_z);
+    out_model = Math::normalize(Vector3(Math::dotProduct(col_x, q),
+                                        Math::dotProduct(col_y, q),
+                                        Math::dotProduct(col_z, q)));
     return true;
+}
+
+// Equirectangular map pixel <-> unit-sphere point. Same convention as the
+// pixel->cell lookup: u in [0,1] spans lon -pi..pi, v in [0,1] spans lat
+// +pi/2..-pi/2.
+static Vector3 mapUVToSphere(double u, double v) {
+    double lat = Math::PI * 0.5 - v * Math::PI;
+    double lon = u * 2.0 * Math::PI - Math::PI;
+    return Math::sphericalToCartesian(lat, lon);
+}
+
+static void sphereToMapUV(const Vector3& p, double& u, double& v) {
+    double lat, lon;
+    Math::cartesianToSpherical(p, lat, lon);
+    u = (lon + Math::PI) / (2.0 * Math::PI);
+    v = (Math::PI * 0.5 - lat) / Math::PI;
 }
 
 // Rebuild all 2D map textures from the planet and publish it as the active
@@ -140,11 +177,39 @@ static void publishMaps(std::shared_ptr<GoldbergPolyhedron> planet,
     hydrology_pixels = std::move(y_pixels);
     temperature_pixels = std::move(t_pixels);
     moisture_pixels = std::move(m_pixels);
+    map_cell_lookup = std::move(cellMap);
     active_planet = planet;
     new_map_ready = true;
     update_3d_geometry = true;
     update_3d_colors = true;
 }
+
+// Wall-clock time per pipeline stage: lap("name") closes the stage that just
+// ran; report() prints the table and appends it to worldgen.log.
+class StageTimer {
+public:
+    void lap(const char* name) {
+        auto now = std::chrono::steady_clock::now();
+        stages.emplace_back(name, std::chrono::duration<double>(now - last).count());
+        last = now;
+    }
+    void report(const char* title) const {
+        std::ostringstream o;
+        double total = 0.0;
+        for (const auto& s : stages) total += s.second;
+        o << std::fixed << std::setprecision(2) << "-- " << title << " (" << total << " s) --\n";
+        for (const auto& s : stages)
+            o << "  " << std::left << std::setw(22) << s.first << std::right
+              << std::setw(7) << s.second << " s\n";
+        o << "\n";
+        std::cout << o.str() << std::flush;
+        std::ofstream f("worldgen.log", std::ios::app);
+        if (f) f << o.str();
+    }
+private:
+    std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
+    std::vector<std::pair<std::string, double>> stages;
+};
 
 // Re-derive climate -> hydrology -> biomes -> soils from the (edited)
 // elevation field, without regenerating the mesh or re-running tectonics and
@@ -164,24 +229,31 @@ void recomputeDerivedFields(SimulationParameters p) {
     p.seed = last_world_seed.load(); // keep noise fields identical to generation
 
     std::cout << "Recomputing climate after terrain edit..." << std::endl;
+    StageTimer timer;
     AtmosphereSimulator atmosphere(*planet);
     atmosphere.calculatePrimaryClimate(p);
+    timer.lap("primary climate");
 
     OceanSimulator ocean(*planet);
     ocean.simulateCurrents(p);
 
     atmosphere.calculateFullClimate(p.moisture_iterations, p);
+    timer.lap("winds + moisture");
 
     HydrologySimulator hydrology(*planet);
     hydrology.simulate(p);
+    timer.lap("hydrology");
 
     atmosphere.assignBiomes(p);
 
     PedologySimulator pedology(*planet);
     pedology.classifyBedrock(p);
     pedology.generateSoils(p);
+    timer.lap("biomes + soils");
 
     publishMaps(planet, p);
+    timer.lap("2D maps");
+    timer.report("Recompute timing");
     std::cout << "Recompute complete." << std::endl;
     is_simulating = false;
 }
@@ -193,10 +265,11 @@ static void startRecompute() {
     sim_thread = std::thread(recomputeDerivedFields, params);
 }
 
-// Apply one brush dab at the cursor. Runs on the main thread; never while a
-// background simulation owns the cells.
-static void paintAtCursor(double mx, double my) {
-    if (is_simulating || !show_3d) return;
+// Apply one brush dab centered on the unit-sphere point p. `cell` is the cell
+// under p when the caller already knows it (2D map lookup), or -1 to search.
+// Runs on the main thread; never while a background simulation owns the cells.
+static void paintAtPoint(const Vector3& p, int cell) {
+    if (is_simulating) return;
     std::shared_ptr<GoldbergPolyhedron> planet;
     {
         std::lock_guard<std::mutex> lock(pixel_mutex);
@@ -204,9 +277,7 @@ static void paintAtCursor(double mx, double my) {
     }
     if (!planet || !terrain_editor.hasBase()) return;
 
-    Vector3 p;
-    if (!pickSpherePoint(g_window, mx, my, p)) return;
-    int cell = TerrainEditor::pickCell(*planet, p);
+    if (cell < 0) cell = TerrainEditor::pickCell(*planet, p);
     if (cell < 0 || cell == last_painted_cell) return; // one dab per cell crossed
     last_painted_cell = cell;
 
@@ -214,12 +285,23 @@ static void paintAtCursor(double mx, double my) {
     EditOpType type = (brush_mode == 0) ? EditOpType::RAISE : EditOpType::LOWER;
     if (terrain_editor.applyDab(*planet, type, p, radius_rad, brush_strength_m)) {
         stroke_made_changes = true;
-        update_3d_colors = true; // show the raw terrain change immediately
+        update_3d_colors = true;  // show the raw terrain change immediately
+        map_preview_dirty = true; // ...and on the 2D map
     }
 }
 
+// Brush dab under the cursor on the 3D globe.
+static void paintAtCursor(double mx, double my) {
+    if (!show_3d) return;
+    Vector3 p;
+    if (!pickSpherePoint(g_window, mx, my, p)) return;
+    paintAtPoint(p, -1);
+}
+
 void mouse_button_callback(GLFWwindow* window, int button, int action, int mods) {
-    if (ImGui::GetIO().WantCaptureMouse) return;
+    // Releases are always handled: a press on the globe followed by a release
+    // over a UI panel must still end the drag / stroke.
+    if (action == GLFW_PRESS && ImGui::GetIO().WantCaptureMouse) return;
     if (button == GLFW_MOUSE_BUTTON_LEFT) {
         if (action == GLFW_PRESS) {
             if (edit_mode && show_3d && !is_simulating && active_planet) {
@@ -255,10 +337,21 @@ void cursor_position_callback(GLFWwindow* window, double xpos, double ypos) {
         return;
     }
     if (is_dragging) {
-        camera_yaw += (xpos - last_mouse_x) * 0.01f;
-        camera_pitch += (ypos - last_mouse_y) * 0.01f;
-        if(camera_pitch > 1.5707f) camera_pitch = 1.5707f;
-        if(camera_pitch < -1.5707f) camera_pitch = -1.5707f;
+        // Grab-and-drag: the surface under the cursor follows the mouse, so
+        // the angle per pixel shrinks as the camera gets closer.
+        int ww = 0, wh = 0;
+        glfwGetWindowSize(window, &ww, &wh);
+        float rad_per_px = 2.0f * tanf(kCameraFovY * 0.5f) *
+                           (camera_distance - 1.0f) / static_cast<float>(std::max(wh, 1));
+        float lon_scale = 1.0f / std::max(cosf(camera_lat), 0.2f);
+        camera_lon -= static_cast<float>(xpos - last_mouse_x) * rad_per_px * lon_scale;
+        camera_lat += static_cast<float>(ypos - last_mouse_y) * rad_per_px;
+
+        const float pi = 3.1415926535f;
+        const float max_lat = pi * 0.5f - 0.01f; // stop just short of the poles
+        camera_lat = std::max(-max_lat, std::min(max_lat, camera_lat));
+        if (camera_lon > pi) camera_lon -= 2.0f * pi;
+        if (camera_lon < -pi) camera_lon += 2.0f * pi;
     }
     last_mouse_x = xpos;
     last_mouse_y = ypos;
@@ -266,9 +359,10 @@ void cursor_position_callback(GLFWwindow* window, double xpos, double ypos) {
 
 void scroll_callback(GLFWwindow* window, double xoffset, double yoffset) {
     if (ImGui::GetIO().WantCaptureMouse) return;
-    camera_distance -= yoffset * 0.2f;
-    if (camera_distance < 1.1f) camera_distance = 1.1f;
-    if (camera_distance > 10.0f) camera_distance = 10.0f;
+    // Zoom scales the height above the surface, so each step feels the same
+    // far away and close up.
+    float height = (camera_distance - 1.0f) * powf(0.85f, static_cast<float>(yoffset));
+    camera_distance = std::max(kCameraMinDistance, std::min(kCameraMaxDistance, 1.0f + height));
 }
 
 static const char *biomeName(BiomeType b) {
@@ -493,27 +587,34 @@ void runSimulation(SimulationParameters params) {
   std::cout << "Starting simulation (seed: " << params.seed << ")..."
             << std::endl;
   auto new_planet = std::make_shared<GoldbergPolyhedron>();
+  StageTimer timer;
 
   new_planet->generate(params.subdivision_level);
+  timer.lap("mesh");
 
   TectonicSimulator tectonics(*new_planet);
   tectonics.generatePlates(params.num_plates, params);
   tectonics.simulate(params.tectonic_iterations(), params);
+  timer.lap("tectonics");
 
   AtmosphereSimulator atmosphere(*new_planet);
   atmosphere.calculatePrimaryClimate(params);
+  timer.lap("primary climate");
 
   ErosionSimulator erosion(*new_planet);
   int scaled_drops = static_cast<int>(params.num_drops * (params.planet_age_Myr / 500.0f));
   erosion.simulateErosion(scaled_drops, params);
+  timer.lap("erosion");
 
   OceanSimulator ocean(*new_planet);
   ocean.simulateCurrents(params);
 
   atmosphere.calculateFullClimate(params.moisture_iterations, params);
+  timer.lap("winds + moisture");
 
   HydrologySimulator hydrology(*new_planet);
   hydrology.simulate(params);
+  timer.lap("hydrology");
 
   // Re-assign biomes after hydrology (riparian moisture changes biomes)
   atmosphere.assignBiomes(params);
@@ -521,6 +622,7 @@ void runSimulation(SimulationParameters params) {
   PedologySimulator pedology(*new_planet);
   pedology.classifyBedrock(params); // refine rock types from relief + climate
   pedology.generateSoils(params);
+  timer.lap("biomes + soils");
 
   // Record parameters + diagnostics for this world (stdout + worldgen.log)
   logWorldStats(*new_planet, params);
@@ -534,13 +636,23 @@ void runSimulation(SimulationParameters params) {
   }
 
   publishMaps(new_planet, params);
+  timer.lap("2D maps");
+  timer.report("Generation timing");
 
   std::cout << "Simulation complete! (seed: " << params.seed << ")"
             << std::endl;
   is_simulating = false;
 }
 
-int main() {
+int main(int argc, char **argv) {
+  // --headless [subdivision]: generate one world with the default parameters,
+  // print the stats and stage timings, and exit without opening a window.
+  if (argc > 1 && std::string(argv[1]) == "--headless") {
+    if (argc > 2) params.subdivision_level = std::atoi(argv[2]);
+    runSimulation(params);
+    return 0;
+  }
+
   if (!glfwInit())
     return -1;
 
@@ -743,11 +855,13 @@ int main() {
     ImGui::Text("Terrain Editing");
     ImGui::Separator();
 
-    ImGui::Checkbox("Edit Mode", &edit_mode);
+    if (ImGui::Checkbox("Edit Mode", &edit_mode) && edit_mode)
+      show_3d = false; // editing happens on the 2D map by default
     if (ImGui::IsItemHovered())
-      ImGui::SetTooltip("Paint on the 3D globe with Left Click + Drag.\n"
+      ImGui::SetTooltip("Paint on the 2D map with Left Click + Drag.\n"
                         "On release, climate, rivers and biomes are recomputed\n"
-                        "around your edit. Rotate with Right Click + Drag.");
+                        "around your edit. The 3D globe can be painted too\n"
+                        "(rotate it with Right Click + Drag).");
 
     if (edit_mode) {
       const char *brush_items[] = {"Raise", "Lower"};
@@ -788,9 +902,6 @@ int main() {
           }
         }
       }
-      if (!show_3d)
-        ImGui::TextColored(ImVec4(1, 0.6f, 0.3f, 1),
-                           "Enable the 3D globe to paint.");
       if (!terrain_editor.hasBase())
         ImGui::TextColored(ImVec4(1, 0.6f, 0.3f, 1),
                            "Generate a world first.");
@@ -834,17 +945,120 @@ int main() {
             ImGui::TextColored(ImVec4(0.5f, 1.0f, 0.5f, 1.0f), "Left Click + Drag to Rotate");
         }
         ImGui::TextColored(ImVec4(0.5f, 1.0f, 0.5f, 1.0f), "Scroll to Zoom");
-        if (ImGui::Button("Reset Camera (North Up)")) {
-            camera_pitch = -1.570796f;
-            camera_yaw = 0.0f;
+        if (ImGui::Button("Reset Camera")) {
+            camera_lat = 0.0f;
+            camera_lon = 0.0f;
+            camera_distance = 3.0f;
         }
     }
 
     if (!show_3d && map_texture != 0) {
-      ImGui::Image((void *)(intptr_t)map_texture,
-                   ImVec2(static_cast<float>(tex_width),
-                          static_cast<float>(tex_height)));
+      if (edit_mode)
+        ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.4f, 1.0f), "Left Click + Drag on the map to Paint");
+
+      // Fit the 2:1 map to the window width.
+      float map_w = std::max(256.0f, ImGui::GetContentRegionAvail().x);
+      ImVec2 map_size(map_w, map_w * 0.5f);
+      ImVec2 map_min = ImGui::GetCursorScreenPos();
+      ImGui::Image((void *)(intptr_t)map_texture, map_size);
+      // An invisible button over the image takes the mouse, so dragging on the
+      // map paints instead of moving the window.
+      ImGui::SetCursorScreenPos(map_min);
+      ImGui::InvisibleButton("map_canvas", map_size);
+      bool map_hovered = ImGui::IsItemHovered();
+
+      std::shared_ptr<GoldbergPolyhedron> map_planet;
+      {
+        std::lock_guard<std::mutex> lock(pixel_mutex);
+        if (!is_simulating) map_planet = active_planet;
+      }
+      bool lookup_ok = map_planet && map_cell_lookup.size() ==
+                       static_cast<size_t>(tex_width) * tex_height;
+
+      if (map_hovered && lookup_ok) {
+        ImVec2 mouse = ImGui::GetMousePos();
+        double u = std::max(0.0, std::min(1.0, (double)(mouse.x - map_min.x) / map_size.x));
+        double v = std::max(0.0, std::min(1.0, (double)(mouse.y - map_min.y) / map_size.y));
+        int px = static_cast<int>(u * (tex_width - 1) + 0.5);
+        int py = static_cast<int>(v * (tex_height - 1) + 0.5);
+        size_t cell_id = map_cell_lookup[static_cast<size_t>(py) * tex_width + px];
+        Vector3 p = mapUVToSphere(u, v);
+
+        const Cell& hovered = map_planet->getCells()[cell_id];
+        ImGui::Text("Lat %.1f  Lon %.1f  Elevation %.0f m",
+                    hovered.latitude * 180.0 / Math::PI,
+                    hovered.longitude * 180.0 / Math::PI,
+                    hovered.elevation - params.effective_sea_level());
+
+        if (edit_mode && terrain_editor.hasBase()) {
+          // Brush outline: the geodesic circle of the brush, which is not a
+          // circle on an equirectangular map (it widens towards the poles).
+          double radius_rad = brush_radius_km / kPlanetRadiusKm;
+          Vector3 ref = std::abs(p.z) < 0.9 ? Vector3(0, 0, 1) : Vector3(1, 0, 0);
+          Vector3 a = Math::normalize(Math::crossProduct(p, ref));
+          Vector3 b = Math::crossProduct(p, a);
+          ImDrawList* draw = ImGui::GetWindowDrawList();
+          draw->PushClipRect(map_min, ImVec2(map_min.x + map_size.x, map_min.y + map_size.y), true);
+          const int kSegments = 64;
+          ImVec2 prev;
+          for (int s = 0; s <= kSegments; ++s) {
+            double ang = 2.0 * Math::PI * s / kSegments;
+            double ca = std::cos(ang) * std::sin(radius_rad);
+            double sa = std::sin(ang) * std::sin(radius_rad);
+            double cr = std::cos(radius_rad);
+            Vector3 q(cr * p.x + ca * a.x + sa * b.x,
+                      cr * p.y + ca * a.y + sa * b.y,
+                      cr * p.z + ca * a.z + sa * b.z);
+            double qu, qv;
+            sphereToMapUV(q, qu, qv);
+            ImVec2 cur(map_min.x + (float)qu * map_size.x, map_min.y + (float)qv * map_size.y);
+            // Skip the segment that jumps across the +-180 seam.
+            if (s > 0 && std::abs(cur.x - prev.x) < map_size.x * 0.5f)
+              draw->AddLine(prev, cur, IM_COL32(255, 255, 255, 220), 1.5f);
+            prev = cur;
+          }
+          draw->PopClipRect();
+
+          if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+            is_painting_2d = true;
+            stroke_made_changes = false;
+            last_painted_cell = -1;
+            terrain_editor.beginStroke();
+          }
+          if (is_painting_2d && ImGui::IsMouseDown(ImGuiMouseButton_Left))
+            paintAtPoint(p, static_cast<int>(cell_id));
+        }
+      }
+
+      if (is_painting_2d && !ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+        is_painting_2d = false;
+        // Propagate the edit: winds, rain shadow, rivers, biomes.
+        if (stroke_made_changes) startRecompute();
+      }
+
+      // Show the raw terrain change on the active layer while the stroke is in
+      // progress; the full recompute on release refreshes every layer.
+      if (map_preview_dirty && lookup_ok) {
+        float eff_sea = params.effective_sea_level();
+        std::vector<unsigned char>* layers[] = {
+            &biome_pixels, &height_pixels, &lithology_pixels, &pedology_pixels,
+            &hydrology_pixels, &temperature_pixels, &moisture_pixels};
+        std::vector<unsigned char> preview;
+        switch (active_map_index) {
+        case 0: preview = MapExporter::getBiomePixels(*map_planet, tex_width, tex_height, eff_sea, map_cell_lookup); break;
+        case 1: preview = MapExporter::getHeightPixels(*map_planet, tex_width, tex_height, eff_sea, map_cell_lookup); break;
+        case 2: preview = MapExporter::getLithologyPixels(*map_planet, tex_width, tex_height, eff_sea, map_cell_lookup); break;
+        case 3: preview = MapExporter::getPedologyPixels(*map_planet, tex_width, tex_height, eff_sea, map_cell_lookup); break;
+        case 4: preview = MapExporter::getHydrologyPixels(*map_planet, tex_width, tex_height, eff_sea, map_cell_lookup); break;
+        case 5: preview = MapExporter::getTemperaturePixels(*map_planet, tex_width, tex_height, eff_sea, map_cell_lookup); break;
+        default: preview = MapExporter::getMoisturePixels(*map_planet, tex_width, tex_height, eff_sea, map_cell_lookup); break;
+        }
+        std::lock_guard<std::mutex> lock(pixel_mutex);
+        *layers[active_map_index] = std::move(preview);
+        new_map_ready = true;
+      }
     }
+    map_preview_dirty = false;
     ImGui::End();
 
     // Legends & Symbology Panel
@@ -1109,9 +1323,8 @@ int main() {
             glMatrixMode(GL_PROJECTION);
             glLoadIdentity();
             float aspect = (float)display_w / (float)display_h;
-            float fov = 45.0f * 3.1415926535f / 180.0f;
-            float f = 1.0f / tan(fov / 2.0f);
-            float zNear = 0.1f, zFar = 100.0f;
+            float f = 1.0f / tan(kCameraFovY / 2.0f);
+            float zNear = 0.05f, zFar = 100.0f;
             float proj[16] = {
                 f / aspect, 0, 0, 0,
                 0, f, 0, 0,
@@ -1125,10 +1338,17 @@ int main() {
             
             // Translate back
             glTranslatef(0.0f, 0.0f, -camera_distance);
-            // Rotate
-            glRotatef(camera_pitch * 180.0f / 3.1415926535f, 1.0f, 0.0f, 0.0f);
-            glRotatef(camera_yaw * 180.0f / 3.1415926535f, 0.0f, 1.0f, 0.0f);
-            
+            // Rotate (column-major, same matrix pickSpherePoint inverts)
+            Vector3 col_x, col_y, col_z;
+            cameraRotation(col_x, col_y, col_z);
+            float rot[16] = {
+                (float)col_x.x, (float)col_x.y, (float)col_x.z, 0,
+                (float)col_y.x, (float)col_y.y, (float)col_y.z, 0,
+                (float)col_z.x, (float)col_z.y, (float)col_z.z, 0,
+                0, 0, 0, 1
+            };
+            glMultMatrixf(rot);
+
             // Render
             glDrawElements(GL_TRIANGLES, globe_indices.size(), GL_UNSIGNED_INT, globe_indices.data());
 

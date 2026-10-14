@@ -32,29 +32,43 @@ Color getBiomeColor(float temp, float precip, float elevation, float sea_level) 
              static_cast<unsigned char>(b * 255.0f) };
 }
 
-// External CUDA function declaration
-extern void buildPixelToCellMapCUDA(int width, int height, int num_cells, const std::vector<float>& pos_x, const std::vector<float>& pos_y, const std::vector<float>& pos_z, std::vector<size_t>& map);
-
 // ============================================================================
-// Pixel → Cell Lookup Table (O(pixels * cells) — accelerated with CUDA)
+// Pixel → Cell Lookup Table
 // ============================================================================
+// The nearest cell to a point is found by walking the neighbor graph uphill in
+// dot(cell, point) until no neighbor is closer. Each pixel starts from the cell
+// of the pixel before it, so the walk is a step or two: O(pixels) overall
+// instead of testing every cell for every pixel.
 std::vector<size_t> MapExporter::buildPixelToCellMap(const GoldbergPolyhedron& planet, int width, int height) {
     const auto& cells = planet.getCells();
     std::vector<size_t> map(width * height);
-    
-    int num_cells = cells.size();
-    std::vector<float> pos_x(num_cells);
-    std::vector<float> pos_y(num_cells);
-    std::vector<float> pos_z(num_cells);
-    
-    for (int i = 0; i < num_cells; ++i) {
-        pos_x[i] = cells[i].position.x;
-        pos_y[i] = cells[i].position.y;
-        pos_z[i] = cells[i].position.z;
-    }
-    
-    buildPixelToCellMapCUDA(width, height, num_cells, pos_x, pos_y, pos_z, map);
+    if (cells.empty()) return map;
 
+    size_t row_start = 0; // cell of the first pixel of the previous row
+    for (int y = 0; y < height; ++y) {
+        double lat = Math::PI * 0.5 - (static_cast<double>(y) / (height - 1)) * Math::PI;
+        size_t current = row_start;
+        for (int x = 0; x < width; ++x) {
+            double lon = (static_cast<double>(x) / (width - 1)) * 2.0 * Math::PI - Math::PI;
+            Vector3 p = Math::sphericalToCartesian(lat, lon);
+
+            double best = Math::dotProduct(cells[current].position, p);
+            bool moved = true;
+            while (moved) {
+                moved = false;
+                for (size_t nid : cells[current].neighbors) {
+                    double d = Math::dotProduct(cells[nid].position, p);
+                    if (d > best) {
+                        best = d;
+                        current = nid;
+                        moved = true;
+                    }
+                }
+            }
+            map[static_cast<size_t>(y) * width + x] = current;
+            if (x == 0) row_start = current;
+        }
+    }
     return map;
 }
 
