@@ -1,6 +1,7 @@
 #include "../include/HydrologySimulator.h"
 #include "../include/MathUtils.h"
 #include <algorithm>
+#include <cstdint>
 #include <numeric>
 #include <iostream>
 #include <queue>
@@ -55,6 +56,14 @@ void HydrologySimulator::buildDrainageNetwork(const SimulationParameters& params
     const size_t LAKE_MAX_TOTAL   = cells.size() / 120;   // ~0.8% of all cells
     size_t lakeCellsUsed = 0;
 
+    // BFS scratch shared by every pit. A cell counts as visited when its stamp
+    // equals the current pit's epoch, so nothing is cleared or reallocated per
+    // pit (that was O(pits * cells) and dominated generation time).
+    std::vector<size_t> parent(cells.size(), static_cast<size_t>(-1));
+    std::vector<uint32_t> visStamp(cells.size(), 0);
+    std::vector<uint32_t> basinStamp(cells.size(), 0);
+    uint32_t epoch = 0;
+
     for (size_t i = 0; i < cells.size(); ++i) {
         if (cells[i].elevation <= params.sea_level) continue;
         if (cells[i].downstream_id != i) continue; // not a pit
@@ -64,10 +73,10 @@ void HydrologySimulator::buildDrainageNetwork(const SimulationParameters& params
 
         // --- find an escape and the sill along the way ---
         std::queue<size_t> q;
-        std::vector<size_t> parent(cells.size(), static_cast<size_t>(-1));
-        std::vector<char> vis(cells.size(), 0);
+        ++epoch;
         q.push(i);
-        vis[i] = 1;
+        visStamp[i] = epoch;
+        parent[i] = static_cast<size_t>(-1); // path root
         size_t outlet = static_cast<size_t>(-1);
 
         while (!q.empty()) {
@@ -79,8 +88,8 @@ void HydrologySimulator::buildDrainageNetwork(const SimulationParameters& params
                 break;
             }
             for (size_t nid : cells[cur].neighbors) {
-                if (!vis[nid] && cells[nid].elevation < pitElev + CLIMB_BUDGET) {
-                    vis[nid] = 1;
+                if (visStamp[nid] != epoch && cells[nid].elevation < pitElev + CLIMB_BUDGET) {
+                    visStamp[nid] = epoch;
                     parent[nid] = cur;
                     q.push(nid);
                 }
@@ -101,9 +110,8 @@ void HydrologySimulator::buildDrainageNetwork(const SimulationParameters& params
         bool basinTouchesOcean = false;
         {
             std::queue<size_t> bq;
-            std::vector<char> bvis(cells.size(), 0);
             bq.push(i);
-            bvis[i] = 1;
+            basinStamp[i] = epoch;
             while (!bq.empty()) {
                 size_t cur = bq.front();
                 bq.pop();
@@ -111,8 +119,8 @@ void HydrologySimulator::buildDrainageNetwork(const SimulationParameters& params
                 if (basin.size() > static_cast<size_t>(LAKE_MAX_BASIN)) { basinTooBig = true; break; }
                 for (size_t nid : cells[cur].neighbors) {
                     if (cells[nid].elevation <= params.sea_level) { basinTouchesOcean = true; continue; }
-                    if (!bvis[nid] && !cells[nid].is_lake && cells[nid].elevation < sill) {
-                        bvis[nid] = 1;
+                    if (basinStamp[nid] != epoch && !cells[nid].is_lake && cells[nid].elevation < sill) {
+                        basinStamp[nid] = epoch;
                         bq.push(nid);
                     }
                 }

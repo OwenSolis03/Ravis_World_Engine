@@ -11,7 +11,7 @@ public:
     // Exports the planet data to 2D Equirectangular projection images (PNG).
     static void exportAllMaps(const GoldbergPolyhedron& planet, int width, int height, float sea_level);
 
-    // Precompute the pixel→cell lookup table (O(pixels * cells) — run ONCE)
+    // Precompute the pixel→cell lookup table (O(pixels), run once per mesh)
     // Then pass it to the fast get*Pixels overloads below for O(pixels) rendering.
     static std::vector<size_t> buildPixelToCellMap(const GoldbergPolyhedron& planet, int width, int height);
 
