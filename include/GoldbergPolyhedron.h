@@ -1,16 +1,17 @@
 #pragma once
 
 #include "PlanetData.h"
-#include <vector>
+#include <cstdint>
 #include <unordered_map>
+#include <vector>
 
 namespace Ravis {
 
-// Custom hash for std::pair<size_t, size_t> to enable unordered_map usage
+// Hash simétrico para std::pair<size_t, size_t>
 struct PairHash {
-    size_t operator()(const std::pair<size_t,size_t>& p) const {
+    size_t operator()(const std::pair<size_t, size_t>& p) const {
         return std::hash<size_t>()(p.first) ^
-               (std::hash<size_t>()(p.second) << 32);
+               (std::hash<size_t>()(p.second) * 0x9e3779b97f4a7c15ULL + (std::hash<size_t>()(p.first) << 6));
     }
 };
 
@@ -18,11 +19,8 @@ class GoldbergPolyhedron {
 public:
     GoldbergPolyhedron();
 
-    // Generates the Goldberg Polyhedron based on the subdivision level of an Icosahedron.
-    // Each vertex of the resulting icosphere becomes a Cell (hexagon or pentagon) in our simulation.
-    // subdivisionLevel 0: 12 cells (all pentagons)
-    // subdivisionLevel 1: 42 cells
-    // subdivisionLevel 2: 162 cells
+    // Genera el poliedro de Goldberg subdividiendo un icosaedro base,
+    // relaja la malla sobre la esfera y ordena topológicamente los vecinos.
     void generate(int subdivisionLevel);
 
     const std::vector<Cell>& getCells() const { return cells; }
@@ -38,21 +36,30 @@ public:
     const std::vector<Vector3>& getVertices() const { return vertices; }
     const std::vector<Triangle>& getTriangles() const { return triangles; }
 
+    // Buffers planos precalculados para CUDA:
+    // rowMajorNeighbors: [num_cells * 6] (compatible con kernels actuales i * 6 + n)
+    // transposedNeighbors: [6 * num_cells] (para acceso coalescente n * num_cells + i)
+    const std::vector<int>& getRowMajorNeighbors() const { return rowMajorNeighbors; }
+    const std::vector<int>& getTransposedNeighbors() const { return transposedNeighbors; }
+    const std::vector<int>& getNeighborCounts() const { return neighborCounts; }
+
 private:
     std::vector<Cell> cells;
-
     std::vector<Vector3> vertices;
     std::vector<Triangle> triangles;
 
-    // Helper to add a vertex, normalizes it to sit on the unit sphere, and returns its index
+    std::vector<int> rowMajorNeighbors;
+    std::vector<int> transposedNeighbors;
+    std::vector<int> neighborCounts;
+
     size_t addVertex(const Vector3& v);
 
-    // Caches midpoint indices to avoid duplicating vertices during subdivision
     std::unordered_map<std::pair<size_t, size_t>, size_t, PairHash> midpointCache;
     size_t getMidpointIndex(size_t v1, size_t v2);
 
     void buildBaseIcosahedron();
     void subdivide();
+    void relaxMesh(int passes);
     void extractCells();
 };
 
