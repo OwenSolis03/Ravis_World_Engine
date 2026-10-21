@@ -1,8 +1,7 @@
 #pragma once
 #include "GoldbergPolyhedron.h"
-#include <vector>
-
 #include "SimulationParameters.h"
+#include <vector>
 
 namespace Ravis {
 
@@ -10,11 +9,12 @@ class TectonicSimulator {
 public:
     TectonicSimulator(GoldbergPolyhedron& planet);
 
-    // Initializes plates using spherical Voronoi (multi-source BFS)
-    // Randomly assigns Oceanic or Continental crust types and base elevations.
+    // Inicializa placas mediante Voronoi esférico con domain-warping dependiente de la semilla,
+    // asigna tipos de corteza, edades iniciales y espesores isostáticos.
     void generatePlates(int numPlates, const SimulationParameters& params);
 
-    // Run the geological simulation for a number of iterations
+    // Ejecuta la simulación tectónica acoplando advección, enfriamiento cortical,
+    // orogénesis asimétrica, cadenas de puntos calientes y geomorfología.
     void simulate(int iterations, const SimulationParameters& params);
 
 private:
@@ -22,22 +22,20 @@ private:
 
     struct Hotspot {
         Vector3 position;
-        float strength;
+        float strength = 100.0f;
         float radius = 0.1f;
         bool is_deep = false;
     };
     std::vector<Hotspot> hotspots;
 
     struct PlateData {
-        bool is_oceanic;
-        Vector3 rotation_axis;
-        float angular_speed;
-        Vector3 center; // Seed centroid position
+        bool is_oceanic = false;
+        Vector3 rotation_axis = Vector3(0, 0, 1);
+        float angular_speed = 0.0f;
+        Vector3 center = Vector3(1, 0, 0);
     };
     std::vector<PlateData> plates;
 
-    void simulateStep(const SimulationParameters& params);
-    void simulateHotspots();
     void generateHotspots(const SimulationParameters& params);
     void applyTerrainFeatures(const SimulationParameters& params);
 };

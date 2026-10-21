@@ -31,6 +31,7 @@ set(SOURCES
     src/ErosionSimulator.cu
     src/PedologySimulator.cpp
     src/HydrologySimulator.cpp
+    src/VegetationSimulator.cpp
     src/TerrainEditor.cpp
 )
 
